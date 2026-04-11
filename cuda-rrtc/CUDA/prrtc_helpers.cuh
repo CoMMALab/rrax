@@ -19,7 +19,7 @@
 #define WARP_SIZE 32
 
 // Thread block size for parallel operations
-#define BLOCK_SIZE 256
+#define BLOCK_SIZE 128
 
 // Collision check result constants
 #define COLLISION_FREE 0

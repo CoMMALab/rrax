@@ -3,3 +3,5 @@
 .ruff_cache/
 .claude/
 __pycache__/
+cuda-rrtc.*.so
+cuda-rrtc/jax/__pycache__/*

@@ -113,7 +113,7 @@ static ffi::Error PrrtcNearestNeighborImpl(
     if (h_tree_size > max_nodes) h_tree_size = max_nodes;
     if (h_tree_size < 1) h_tree_size = 1;
     
-    int threads = 256;
+    int threads = 16;
     size_t smem = threads * (sizeof(float) + sizeof(int));
     dim3 grid(batch);
     

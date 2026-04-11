@@ -83,9 +83,11 @@ def _load_and_register() -> None:
 def prrtc_plan(
     start_config: Float[Array, "*batch dim"],
     goal_configs: Float[Array, "num_goals dim"],
-    max_iterations: int = 10000,
+    max_iterations: int = 1_000_000,
     step_size: float = 0.5,
-    num_new_samples: int = 600,
+    num_new_samples: int = 128,
+    granularity: int = 16,
+    max_nodes: int = 1_000_000,
     balance_mode: int = 1,
     tree_ratio: float = 0.5,
     dynamic_domain: bool = True,
@@ -106,6 +108,9 @@ def prrtc_plan(
         max_iterations: Maximum number of planning iterations.
         step_size: Maximum extension step size.
         num_new_samples: Number of new samples to generate per iteration.
+        granularity: Threads per block (= waypoints checked per edge). Must be a
+            power of 2, max 64. Matches pRRTC's ``granularity`` parameter.
+        max_nodes: Maximum nodes per tree. Defaults to 1,000,000 matching pRRTC.
         balance_mode: Tree balancing mode (0/1/2) matching pRRTC settings.
         tree_ratio: Balance threshold ratio used by mode 1/2.
         dynamic_domain: Enable dynamic-domain radius adaptation.
@@ -160,7 +165,6 @@ def prrtc_plan(
 
     start_vec = start_config.reshape(dim)
     goal_flat = goal_configs.reshape(-1, dim)
-    num_goals = goal_flat.shape[0]
 
     # Get joint limits from robot or use defaults
     if min_vals is None:
@@ -176,8 +180,11 @@ def prrtc_plan(
     if step_size <= 0.0:
         raise ValueError("step_size must be > 0")
 
-    # Compute max nodes based on iterations and batch size
-    max_nodes = max_iterations + num_goals + 1000
+    granularity = int(granularity)
+    if granularity < 1 or (granularity & (granularity - 1)) != 0:
+        raise ValueError(f"granularity must be a power of 2, got {granularity}")
+    if granularity > 64:
+        raise ValueError(f"granularity must be <= 64 (PRRTC_BLOCK_THREADS_MAX), got {granularity}")
 
     # Determine output shapes for FFI call
     result_shapes = (
@@ -289,6 +296,7 @@ def prrtc_plan(
         dd_min_radius=np.float32(dd_min_radius),
         dim=np.int32(dim),
         max_nodes=np.int32(max_nodes),
+        granularity=np.int32(granularity),
     )
 
     # Extract result

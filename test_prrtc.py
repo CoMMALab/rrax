@@ -536,7 +536,7 @@ def main():
                 start_config=start_config,
                 goal_configs=goal_config.reshape(1, -1),
                 max_iterations=5000,
-                step_size=1,
+                step_size=0.5,
                 num_new_samples=64,
                 dynamic_domain=False,
                 min_vals=jnp.array(lo, dtype=jnp.float32),

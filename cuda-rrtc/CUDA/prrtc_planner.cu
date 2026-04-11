@@ -36,9 +36,11 @@ namespace ffi = xla::ffi;
 #define TREE_MAX_NODES 1000000
 #endif
 
-// Threads per block: each block = one parallel explorer (pRRTC uses 4*granularity).
-// With source defaults (granularity=64), this is 256 threads per block.
-#define PRRTC_BLOCK_THREADS 256
+// Maximum threads per block. Granularity is passed at runtime; shared memory
+// arrays are sized to this maximum. Must be a power of 2.
+// Matches pRRTC's source default (4*granularity = 4*64 = 256 was its max; we cap at 64
+// because collision checks dominate and registers become the bottleneck above that).
+#define PRRTC_BLOCK_THREADS_MAX 64
 
 // Global state
 __device__ int d_prrtc_solved = 0;
@@ -325,15 +327,16 @@ __global__ void prrtc_planner_kernel(
     float dd_radius,
     float dd_min_radius,
     int dim,
-    int max_nodes
+    int max_nodes,
+    int granularity
 ) {
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
 
     // --- Shared memory ---
-    // NN reduction arrays (one entry per thread in block)
-    __shared__ float sdata[PRRTC_BLOCK_THREADS];
-    __shared__ int   sindex_sh[PRRTC_BLOCK_THREADS];
+    // NN reduction arrays (one entry per thread in block; sized to max granularity)
+    __shared__ float sdata[PRRTC_BLOCK_THREADS_MAX];
+    __shared__ int   sindex_sh[PRRTC_BLOCK_THREADS_MAX];
 
     // Per-block Halton state (like pRRTC's per-block HaltonState)
     __shared__ int halton_st[CONFIG_DIM_MAX];
@@ -712,7 +715,8 @@ static ffi::Error PrrtcPlannerImpl(
     float dd_radius,
     float dd_min_radius,
     int dim,
-    int max_nodes
+    int max_nodes,
+    int granularity
 ) {
     const int num_goals = static_cast<int>(goal_configs.dimensions()[0]);
     const int n_joints = static_cast<int>(fk_parent_idx.dimensions().size() == 0 ? 0 : fk_parent_idx.dimensions()[0]);
@@ -824,7 +828,7 @@ static ffi::Error PrrtcPlannerImpl(
         return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
     }
 
-    int threads_fill = 256;
+    int threads_fill = 16;
     int blocks_fill = (max_nodes + threads_fill - 1) / threads_fill;
     prrtc_fill_float_kernel<<<blocks_fill, threads_fill, 0, stream>>>(tree_a_radii, FLT_MAX, max_nodes);
     prrtc_fill_float_kernel<<<blocks_fill, threads_fill, 0, stream>>>(tree_b_radii, FLT_MAX, max_nodes);
@@ -856,8 +860,9 @@ static ffi::Error PrrtcPlannerImpl(
 
     // Launch one block per sample (num_new_samples blocks), each block is an
     // independent explorer — matching pRRTC's num_new_configs-block launch pattern.
+    // Block size = granularity (must be power of 2, capped at PRRTC_BLOCK_THREADS_MAX).
     // All shared memory is statically declared; no dynamic shared memory needed.
-    prrtc_planner_kernel<<<num_new_samples, PRRTC_BLOCK_THREADS, 0, stream>>>(
+    prrtc_planner_kernel<<<num_new_samples, granularity, 0, stream>>>(
         tree_a_configs->typed_data(),
         tree_b_configs->typed_data(),
         tree_a_parents->typed_data(),
@@ -882,7 +887,8 @@ static ffi::Error PrrtcPlannerImpl(
         dd_radius,
         dd_min_radius,
         dim,
-        max_nodes
+        max_nodes,
+        granularity
     );
 
     e = cudaGetLastError();
@@ -942,4 +948,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("dd_min_radius")
         .Attr<int>("dim")
         .Attr<int>("max_nodes")
+        .Attr<int>("granularity")
 );
