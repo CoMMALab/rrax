@@ -6,10 +6,8 @@ Test script for pRRTC with a VAMP problem from pyronot.
 import sys
 import importlib.util
 import argparse
-import pickle
 import time
 from pathlib import Path
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -17,7 +15,6 @@ import numpy as np
 try:
     import pyronot as pk
     import yourdfpy
-    from pyronot.collision._geometry import Box, Capsule, HalfSpace, Sphere
     from pyronot.collision._obstacles import create_collision_environment
     from pyronot.collision._robot_collision import RobotCollisionSpherized
 except ImportError as e:
@@ -34,6 +31,18 @@ try:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     prrtc_plan = mod.prrtc_plan
+    prrtc_plan_batch = mod.prrtc_plan_batch
+
+    utils_impl = Path(__file__).parent / "cuda-rrtc" / "jax" / "utils.py"
+    utils_spec = importlib.util.spec_from_file_location("cuda_rrtc_utils", utils_impl)
+    if utils_spec is None or utils_spec.loader is None:
+        raise ImportError(f"Failed to load module spec from {utils_impl}")
+    utils_mod = importlib.util.module_from_spec(utils_spec)
+    utils_spec.loader.exec_module(utils_mod)
+
+    load_vamp_problem = utils_mod.load_vamp_problem
+    build_prrtc_collision_context = utils_mod.build_prrtc_collision_context
+    config_collision_report = utils_mod.config_collision_report
 except Exception as e:
     print(f"cuda-rrtc import error: {e}")
     print("Make sure the library is compiled: cd cuda-rrtc && bash build.sh")
@@ -42,187 +51,6 @@ except Exception as e:
 
 RESOURCE_ROOT = Path("/home/scoumar/Work/rrax/pyronot/resources")
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
-
-
-def load_vamp_problem(problem: str = "bookshelf_tall", index: int = 1):
-    """Load a single VAMP problem dict for obstacle visualization."""
-    problems_path = RESOURCE_ROOT / "panda" / "problems.pkl"
-    if not problems_path.exists():
-        print(f"  VAMP problems file not found: {problems_path}")
-        return None
-
-    try:
-        with open(problems_path, "rb") as f:
-            data = pickle.load(f)
-    except Exception as e:
-        print(f"  Failed to load VAMP problems: {e}")
-        return None
-
-    problem_map = data.get("problems", {})
-    if problem not in problem_map:
-        print(f"  VAMP problem '{problem}' not found. Available: {list(problem_map.keys())[:5]}")
-        return None
-
-    try:
-        return next(p for p in problem_map[problem] if p.get("index") == index)
-    except StopIteration:
-        print(f"  VAMP problem '{problem}' has no index {index}")
-        return None
-
-
-def _sphere_geom_to_array(sphere_geom) -> np.ndarray:
-    """Convert a (possibly batched) Sphere geom to [N,4] float32 array."""
-    axes = sphere_geom.get_batch_axes()
-    if len(axes) == 0:
-        sphere_geom = sphere_geom.broadcast_to((1,))
-    elif len(axes) > 1:
-        sphere_geom = sphere_geom.reshape((-1,))
-    centers = np.asarray(sphere_geom.pose.translation(), dtype=np.float32)
-    radii = np.asarray(sphere_geom.radius, dtype=np.float32).reshape(-1, 1)
-    return np.concatenate([centers, radii], axis=-1)
-
-
-def world_obstacles_to_exact(obstacles) -> dict[str, np.ndarray]:
-    """Extract world obstacles in their native geometry types for CUDA pRRTC.
-
-    The CUDA kernel supports sphere, capsule, box, and halfspace primitives
-    natively.  Converting everything to spheres (the old approach) inflates
-    obstacle volumes and makes collision checking overly conservative in
-    narrow passages.
-    """
-    spheres: list[np.ndarray] = []
-    capsules: list[np.ndarray] = []
-    boxes: list[np.ndarray] = []
-    halfspaces: list[np.ndarray] = []
-
-    for obs in obstacles or []:
-        if isinstance(obs, Sphere):
-            spheres.append(_sphere_geom_to_array(obs))
-        elif isinstance(obs, Capsule):
-            # Capsule: [x1, y1, z1, x2, y2, z2, radius]
-            axes = obs.get_batch_axes()
-            if len(axes) == 0:
-                obs = obs.broadcast_to((1,))
-            elif len(axes) > 1:
-                obs = obs.reshape((-1,))
-            centers = np.asarray(obs.pose.translation(), dtype=np.float32)
-            axis_dir = np.asarray(obs.axis, dtype=np.float32)
-            half_h = np.asarray(obs.height, dtype=np.float32).reshape(-1, 1) / 2.0
-            radii = np.asarray(obs.radius, dtype=np.float32).reshape(-1, 1)
-            p1 = centers - axis_dir * half_h
-            p2 = centers + axis_dir * half_h
-            capsules.append(
-                np.concatenate([p1, p2, radii], axis=-1).astype(np.float32)
-            )
-        elif isinstance(obs, Box):
-            # Box: [cx, cy, cz, a1x..a1z, a2x..a2z, a3x..a3z, hl1, hl2, hl3]
-            axes = obs.get_batch_axes()
-            if len(axes) == 0:
-                obs = obs.broadcast_to((1,))
-            elif len(axes) > 1:
-                obs = obs.reshape((-1,))
-            centers = np.asarray(obs.pose.translation(), dtype=np.float32)
-            rot = np.asarray(obs.pose.rotation().as_matrix(), dtype=np.float32)
-            hl = np.asarray(obs.half_lengths, dtype=np.float32)
-            a1 = rot[..., :, 0]
-            a2 = rot[..., :, 1]
-            a3 = rot[..., :, 2]
-            boxes.append(
-                np.concatenate([centers, a1, a2, a3, hl], axis=-1).astype(np.float32)
-            )
-        elif isinstance(obs, HalfSpace):
-            # HalfSpace: [nx, ny, nz, px, py, pz]
-            axes = obs.get_batch_axes()
-            if len(axes) == 0:
-                obs = obs.broadcast_to((1,))
-            elif len(axes) > 1:
-                obs = obs.reshape((-1,))
-            normals = np.asarray(obs.normal, dtype=np.float32)
-            points = np.asarray(obs.pose.translation(), dtype=np.float32)
-            halfspaces.append(
-                np.concatenate([normals, points], axis=-1).astype(np.float32)
-            )
-        elif hasattr(obs, "to_trimesh"):
-            # Fallback: approximate unknown geometry as spheres
-            spheres.append(_sphere_geom_to_array(Sphere.from_trimesh(obs.to_trimesh())))
-
-    def _concat_or_empty(arrs, cols):
-        if arrs:
-            return np.concatenate(arrs, axis=0).astype(np.float32)
-        return np.zeros((0, cols), dtype=np.float32)
-
-    return {
-        "world_spheres": _concat_or_empty(spheres, 4),
-        "world_capsules": _concat_or_empty(capsules, 7),
-        "world_boxes": _concat_or_empty(boxes, 15),
-        "world_halfspaces": _concat_or_empty(halfspaces, 6),
-    }
-
-
-def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
-    """Build collision_context dict expected by cuda-rrtc jax/prrtc.py."""
-    fk_twists = np.asarray(robot.joints.twists, dtype=np.float32)
-    fk_parent_tf = np.asarray(robot.joints.parent_transforms, dtype=np.float32)
-    fk_parent_idx = np.asarray(robot.joints.parent_indices, dtype=np.int32)
-    fk_act_idx = np.asarray(robot.joints.actuated_indices, dtype=np.int32)
-    fk_mimic_mul = np.asarray(robot.joints.mimic_multiplier, dtype=np.float32)
-    fk_mimic_off = np.asarray(robot.joints.mimic_offset, dtype=np.float32)
-    fk_mimic_act_idx = np.asarray(robot.joints.mimic_act_indices, dtype=np.int32)
-    fk_topo_inv = np.asarray(robot.joints._topo_sort_inv, dtype=np.int32)
-
-    sphere_local_full = np.asarray(robot_coll.coll.pose.translation(), dtype=np.float32)
-    sphere_radius_full = np.asarray(robot_coll.coll.radius, dtype=np.float32)
-    n_links, n_spheres_per_link = sphere_radius_full.shape
-    valid = sphere_radius_full > 0.0
-
-    link_ids = np.broadcast_to(np.arange(n_links, dtype=np.int32)[:, None], (n_links, n_spheres_per_link))
-    sphere_link_idx_raw = link_ids[valid]
-    sphere_local = sphere_local_full[valid]
-    sphere_radius = sphere_radius_full[valid]
-
-    # The CUDA FK produces T_world indexed by JOINT (n_joints entries), but
-    # the collision model is indexed by LINK (n_links entries).  For Panda,
-    # n_joints=12 but n_links=13, so link index 12 would read uninitialised
-    # memory.  Remap each sphere's link index to its parent joint index so
-    # the CUDA kernel indexes into T_world correctly.
-    parent_joint_indices = np.asarray(robot.links.parent_joint_indices, dtype=np.int32)
-    sphere_link_idx = parent_joint_indices[sphere_link_idx_raw]
-    # Base-link spheres get parent_joint=-1; the CUDA kernel already skips
-    # negative indices (guard: if link_idx < 0 ... continue).
-
-    flat_index = np.full((n_links, n_spheres_per_link), -1, dtype=np.int32)
-    flat_index[valid] = np.arange(sphere_radius.shape[0], dtype=np.int32)
-
-    pairs = []
-    active_i = np.asarray(robot_coll.active_idx_i, dtype=np.int32)
-    active_j = np.asarray(robot_coll.active_idx_j, dtype=np.int32)
-    for li, lj in zip(active_i, active_j):
-        a = flat_index[li]
-        b = flat_index[lj]
-        a = a[a >= 0]
-        b = b[b >= 0]
-        if a.size == 0 or b.size == 0:
-            continue
-        pairs.append(np.stack(np.meshgrid(a, b, indexing="ij"), axis=-1).reshape(-1, 2))
-    self_pairs = np.concatenate(pairs, axis=0).astype(np.int32) if pairs else np.zeros((0, 2), dtype=np.int32)
-
-    world_geom = world_obstacles_to_exact(world_obstacles)
-
-    return {
-        "fk_twists": fk_twists,
-        "fk_parent_tf": fk_parent_tf,
-        "fk_parent_idx": fk_parent_idx,
-        "fk_act_idx": fk_act_idx,
-        "fk_mimic_mul": fk_mimic_mul,
-        "fk_mimic_off": fk_mimic_off,
-        "fk_mimic_act_idx": fk_mimic_act_idx,
-        "fk_topo_inv": fk_topo_inv,
-        "sphere_link_idx": sphere_link_idx,
-        "sphere_local": sphere_local,
-        "sphere_radius": sphere_radius,
-        "self_pairs": self_pairs,
-        **world_geom,
-    }
 
 
 def validate_path_collision(robot, robot_coll, path, world_obstacles):
@@ -247,46 +75,6 @@ def validate_path_collision(robot, robot_coll, path, world_obstacles):
         "min_margin": min_margin,
         "collision_free": bool(min_margin > 0.0),
     }
-
-
-def config_collision_report(robot, robot_coll, cfg, world_obstacles):
-    """Collision report for a single configuration."""
-    q_jax = jnp.asarray(cfg, dtype=jnp.float32)
-    min_self = float(np.min(np.asarray(robot_coll.compute_self_collision_distance(robot, q_jax))))
-    min_world = np.inf
-    for obs in world_obstacles or []:
-        world_d = robot_coll.compute_world_collision_distance(robot, q_jax, obs)
-        min_world = min(min_world, float(np.min(np.asarray(world_d))))
-    min_margin = min(min_self, min_world)
-    return {
-        "min_self": min_self,
-        "min_world": min_world,
-        "min_margin": min_margin,
-        "collision_free": bool(min_margin > 0.0),
-    }
-
-
-def repair_collision_config(robot, robot_coll, cfg, lo, hi, world_obstacles, rng):
-    """Try to find a nearby collision-free config; fallback to global random samples."""
-    base = np.asarray(cfg, dtype=np.float32)
-    span = (hi - lo).astype(np.float32)
-
-    # First search locally around the original configuration.
-    for scale in (0.01, 0.03, 0.08):
-        for _ in range(400):
-            candidate = np.clip(base + rng.normal(0.0, scale * span), lo, hi)
-            report = config_collision_report(robot, robot_coll, candidate, world_obstacles)
-            if report["collision_free"]:
-                return jnp.asarray(candidate, dtype=jnp.float32), report
-
-    # Then fallback to global samples inside joint limits.
-    for _ in range(1500):
-        candidate = rng.uniform(lo, hi).astype(np.float32)
-        report = config_collision_report(robot, robot_coll, candidate, world_obstacles)
-        if report["collision_free"]:
-            return jnp.asarray(candidate, dtype=jnp.float32), report
-
-    return None, None
 
 
 def visualize_tree_with_viser(robot, urdf, result, obstacles=None, hz: float = 10.0):
@@ -461,7 +249,11 @@ def main():
     n_links_total = int(robot.links.num_links)
     print(f"  {n_act} actuated joints, {n_joints_total} total joints, {n_links_total} links")
 
-    vamp_problem = load_vamp_problem(problem=args.vamp_problem, index=args.vamp_index)
+    vamp_problem = load_vamp_problem(
+        RESOURCE_ROOT,
+        problem=args.vamp_problem,
+        index=args.vamp_index,
+    )
     obstacles = create_collision_environment(vamp_problem) if vamp_problem is not None else []
     collision_context = build_prrtc_collision_context(robot, robot_coll, obstacles)
     ws = collision_context['world_spheres'].shape[0]
@@ -532,7 +324,7 @@ def main():
     single_result = None
     if roots_valid:
         try:
-            result = prrtc_plan(
+            single_plan_kwargs = dict(
                 start_config=start_config,
                 goal_configs=goal_config.reshape(1, -1),
                 max_iterations=5000,
@@ -543,12 +335,24 @@ def main():
                 max_vals=jnp.array(hi, dtype=jnp.float32),
                 collision_context=collision_context,
             )
+            # First call pays setup overhead (e.g., FFI target registration/JIT plumbing).
+            _ = prrtc_plan(**single_plan_kwargs)
+
+            result = prrtc_plan(**single_plan_kwargs)
             single_result = result
             print(f"  Result: solved={result.solved}")
             print(f"  Tree A size: {result.tree_a_size}")
             print(f"  Tree B size: {result.tree_b_size}")
             print(f"  Iterations: {result.iterations}")
             print(f"  Cost: {result.cost:.4f}")
+            if result.kernel_time_ms is not None:
+                print(
+                    "  GPU planner-kernel time (no host dispatch): "
+                    f"{result.kernel_time_ms:.3f} ms"
+                )
+                if result.iterations > 0:
+                    us_per_iter = (result.kernel_time_ms * 1000.0) / float(result.iterations)
+                    print(f"  Timing detail: {us_per_iter:.3f} us/iteration")
             if not result.solved:
                 print(
                     "  Planner failed: "
@@ -594,30 +398,41 @@ def main():
                 grep = config_collision_report(robot, robot_coll, goals_np[i], obstacles)
                 retries += 1
 
-        results = []
-        for i in range(batch_size):
-            result = prrtc_plan(
-                start_config=jnp.array(starts_np[i]),
-                goal_configs=jnp.array(goals_np[i]).reshape(1, -1),
-                max_iterations=1000,
-                step_size=0.6,
-                num_new_samples=16,
-                dynamic_domain=False,
-                min_vals=jnp.array(lo, dtype=jnp.float32),
-                max_vals=jnp.array(hi, dtype=jnp.float32),
-                collision_context=collision_context,
+        batch_plan_kwargs = dict(
+            start_configs=jnp.array(starts_np),
+            goal_configs=jnp.array(goals_np[:, None, :]),  # [batch, 1, dim] — one goal per problem
+            max_iterations=1000,
+            step_size=0.6,
+            num_new_samples=16,
+            dynamic_domain=False,
+            min_vals=jnp.array(lo, dtype=jnp.float32),
+            max_vals=jnp.array(hi, dtype=jnp.float32),
+            collision_context=collision_context,
+        )
+        _ = prrtc_plan_batch(**batch_plan_kwargs)
+        results = prrtc_plan_batch(**batch_plan_kwargs)
+        kernel_times = [r.kernel_time_ms for r in results if r.kernel_time_ms is not None]
+        if kernel_times:
+            total_ms = float(np.sum(np.asarray(kernel_times, dtype=np.float32)))
+            mean_ms = float(np.mean(np.asarray(kernel_times, dtype=np.float32)))
+            max_ms = float(np.max(np.asarray(kernel_times, dtype=np.float32)))
+            print(
+                "  Batch GPU planner-kernel times: "
+                f"mean={mean_ms:.3f} ms, max={max_ms:.3f} ms, sum={total_ms:.3f} ms"
             )
-            results.append(result)
+        for i, result in enumerate(results):
             status = "✓" if result.solved else "✗"
             if result.solved:
                 print(
                     f"  Problem {i}: {status} "
-                    f"(tree_a_size={result.tree_a_size}, tree_b_size={result.tree_b_size}, iters={result.iterations})"
+                    f"(tree_a_size={result.tree_a_size}, tree_b_size={result.tree_b_size}, "
+                    f"iters={result.iterations}, kernel_ms={result.kernel_time_ms:.3f})"
                 )
             else:
                 print(
                     f"  Problem {i}: {status} "
-                    f"(planner failed, tree_a_size={result.tree_a_size}, tree_b_size={result.tree_b_size}, iters={result.iterations})"
+                    f"(planner failed, tree_a_size={result.tree_a_size}, tree_b_size={result.tree_b_size}, "
+                    f"iters={result.iterations}, kernel_ms={result.kernel_time_ms:.3f})"
                 )
 
         success_rate = sum(1 for r in results if r.solved) / batch_size

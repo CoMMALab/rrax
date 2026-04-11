@@ -60,7 +60,6 @@ This compiles the CUDA kernels into `_prrtc_planner_lib.so` in the current direc
 ### Basic Planning
 
 ```python
-import jax
 import jax.numpy as jnp
 from cuda_rrtc.jax import prrtc_plan
 
@@ -72,6 +71,7 @@ goals = jnp.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
 result = prrtc_plan(
     start_config=start,
     goal_configs=goals,
+    allow_unsafe_no_collision=True,  # quick geometric-only demo
     max_iterations=10000,
     step_size=0.5
 )
@@ -84,8 +84,8 @@ else:
 
 ### Collision-Aware Planning (PyRoNot Tensors)
 
-`prrtc_plan` is now collision-aware by default and expects a `collision_context`
-dictionary. CUDA-side FK + sphere collision checks are applied during both extend
+`prrtc_plan` is collision-aware by default and expects a `collision_context`
+dictionary. CUDA-side FK + collision checks are applied during both extend
 and connect.
 
 Required keys:
@@ -101,7 +101,13 @@ Required keys:
 - `sphere_link_idx`: `(n_robot_spheres,)` int32
 - `sphere_local`: `(n_robot_spheres, 3)` float32
 - `sphere_radius`: `(n_robot_spheres,)` float32
-- `world_spheres`: `(n_world_spheres, 4)` float32
+- `world_spheres`: `(n_world_spheres, 4)` float32 (optional)
+
+Additional optional world geometry keys:
+
+- `world_capsules`: `(n_world_capsules, 7)` float32
+- `world_boxes`: `(n_world_boxes, 15)` float32
+- `world_halfspaces`: `(n_world_halfspaces, 6)` float32
 
 Optional keys:
 
@@ -113,14 +119,31 @@ To force geometric-only legacy behavior, set `allow_unsafe_no_collision=True`.
 
 ```python
 import jax
+import jax.numpy as jnp
+from cuda_rrtc.jax import prrtc_plan
 
 # Generate batch of planning problems
 starts = jax.random.uniform(key, (10, 7), minval=-2.0, maxval=2.0)
 goals = jax.random.uniform(key, (10, 7), minval=-2.0, maxval=2.0)
 
+# prrtc_plan expects goal_configs shaped (num_goals, dim), so give each problem
+# a per-item goal set of shape (1, dim)
+goal_sets = goals[:, None, :]
+
 # Vectorize planning across batch dimension
-plan_fn = jax.jit(jax.vmap(prrtc_plan, in_axes=(0, 0, None, None)))
-results = plan_fn(starts, goals, 10000, 0.5)
+plan_fn = jax.jit(
+    jax.vmap(
+        lambda s, gset: prrtc_plan(
+            start_config=s,
+            goal_configs=gset,
+            allow_unsafe_no_collision=True,
+            max_iterations=10000,
+            step_size=0.5,
+        ),
+        in_axes=(0, 0),
+    )
+)
+results = plan_fn(starts, goal_sets)
 
 # Process results
 for i, result in enumerate(results):
@@ -177,6 +200,7 @@ The planner is exposed to JAX via a single FFI primitive:
 result = prrtc_plan(
     start_config,
     goal_configs,
+    allow_unsafe_no_collision=True,
     max_iterations=10000,
     step_size=0.5,
 )
@@ -187,7 +211,7 @@ JAX auto-vectorization via `vmap` is fully supported.
 ## Performance Considerations
 
 - **Tree Size**: The planner supports trees with up to 1,000,000 nodes by default
-- **Batch Size**: Use larger batch sizes (64-256) for better GPU utilization
+- **Samples Per Iteration**: `num_new_samples=128` by default. Typical tuning range is 64-256.
 - **Dimensionality**: Optimal for 7-14 DOF manipulators
 - **Step Size**: Typical values are 0.5-2.0 meters/radians depending on configuration space scale
 
@@ -199,11 +223,21 @@ JAX auto-vectorization via `vmap` is fully supported.
 def prrtc_plan(
     start_config: Float[Array, "*batch dim"],
     goal_configs: Float[Array, "num_goals dim"],
-    max_iterations: int = 10000,
+    max_iterations: int = 1_000_000,
     step_size: float = 0.5,
-    num_new_samples: int = 64,
+    num_new_samples: int = 128,
+    granularity: int = 16,
+    max_nodes: int = 1_000_000,
+    balance_mode: int = 1,
+    tree_ratio: float = 0.5,
+    dynamic_domain: bool = True,
+    dd_alpha: float = 1e-4,
+    dd_radius: float = 4.0,
+    dd_min_radius: float = 1.0,
     min_vals: Optional[Float[Array, "dim"]] = None,
     max_vals: Optional[Float[Array, "dim"]] = None,
+    collision_context: Optional[dict[str, Array]] = None,
+    allow_unsafe_no_collision: bool = False,
 ) -> PRRTCResult:
 ```
 
@@ -217,6 +251,34 @@ class PRRTCResult(NamedTuple):
     tree_b_size: int
     iterations: int
     cost: float
+    kernel_time_ms: Optional[float] = None
+    tree_a_configs: Optional[Array] = None
+    tree_b_configs: Optional[Array] = None
+    tree_a_parents: Optional[Array] = None
+    tree_b_parents: Optional[Array] = None
+
+```
+
+Notes:
+
+- `start_config` is currently one start per call. For many independent problems,
+  use `jax.vmap` as shown above.
+- Goal sets are multi-goal per call: shape `(num_goals, dim)`.
+- Collision-aware planning is the default unless explicitly disabled.
+
+### `prrtc_plan_batch` (module-level)
+
+This helper exists in `cuda_rrtc.jax.prrtc` and runs a full batch in one FFI call.
+It is not re-exported by `cuda_rrtc.jax.__init__`.
+
+```python
+from cuda_rrtc.jax.prrtc import prrtc_plan_batch
+
+results = prrtc_plan_batch(
+    start_configs,            # (batch, dim)
+    goal_configs[:, None, :], # (batch, 1, dim) for one goal each
+    collision_context=cc,
+)
 ```
 
 ### `prrtc_nearest_neighbor`

@@ -36,6 +36,7 @@ class PRRTCResult(NamedTuple):
     tree_b_size: int
     iterations: int
     cost: float
+    kernel_time_ms: Optional[float] = None
     # Raw tree data for visualization (shape: (dim, max_nodes), sliced to tree_*_size)
     tree_a_configs: Optional[Array] = None
     tree_b_configs: Optional[Array] = None
@@ -75,6 +76,7 @@ def _load_and_register() -> None:
         jax.ffi.register_ffi_target(ffi_name, capsule, platform="CUDA")
 
     _register("prrtc_planner", "PrrtcPlannerFfi")
+    _register("prrtc_planner_batch", "PrrtcPlannerBatchFfi")
     _register("prrtc_nearest_neighbor", "PrrtcNearestNeighborFfi")
     _register("prrtc_extend", "PrrtcExtendFfi")
     _register("prrtc_iteration", "PrrtcIterationFfi")
@@ -197,6 +199,7 @@ def prrtc_plan(
         jax.ShapeDtypeStruct((1,), jnp.int32),                # iter_count
         jax.ShapeDtypeStruct((3,), jnp.int32),                # connection_info
         jax.ShapeDtypeStruct((1,), jnp.int32),                # solved_flag
+        jax.ShapeDtypeStruct((1,), jnp.float32),              # kernel_time_ms
     )
 
     # Optional collision/FK context; zero-sized buffers disable collision path.
@@ -326,6 +329,7 @@ def prrtc_plan(
         tree_b_size=size_b,
         iterations=int(result[6][0]),
         cost=float(cost),
+        kernel_time_ms=float(result[9][0]),
         tree_a_configs=tree_a_final[:, :size_a],
         tree_b_configs=tree_b_final[:, :size_b],
         tree_a_parents=result[2][:size_a],
@@ -386,6 +390,224 @@ def _trace_path(
     path_a = jnp.stack(a_nodes, axis=0)
     path_b = jnp.stack(b_nodes, axis=0)
     return jnp.concatenate((path_a, path_b), axis=0)
+
+
+def prrtc_plan_batch(
+    start_configs: Float[Array, "batch dim"],
+    goal_configs: Float[Array, "batch num_goals dim"],
+    max_iterations: int = 1_000_000,
+    step_size: float = 0.5,
+    num_new_samples: int = 128,
+    granularity: int = 16,
+    max_nodes: int = 1_000_000,
+    balance_mode: int = 1,
+    tree_ratio: float = 0.5,
+    dynamic_domain: bool = True,
+    dd_alpha: float = 1e-4,
+    dd_radius: float = 4.0,
+    dd_min_radius: float = 1.0,
+    min_vals: Optional[Float[Array, "dim"]] = None,
+    max_vals: Optional[Float[Array, "dim"]] = None,
+    collision_context: Optional[dict[str, Array]] = None,
+    allow_unsafe_no_collision: bool = False,
+) -> list[PRRTCResult]:
+    """
+    Plan paths for a batch of independent start/goal pairs in parallel on the GPU.
+
+    Each planning problem is launched on its own CUDA stream so all batch
+    elements run concurrently.  Every problem has its own start and its own
+    set of goals; only the planner parameters and collision context are shared.
+
+    Args:
+        start_configs: Batch of start configurations, shape ``(batch, dim)``.
+        goal_configs: Per-problem goal configurations, shape
+            ``(batch, num_goals, dim)``.  Pass shape ``(batch, 1, dim)`` for
+            one goal per problem, or ``(batch, G, dim)`` to give each problem
+            G candidate goals.
+        ...: All other arguments are identical to ``prrtc_plan``.
+
+    Returns:
+        List of ``PRRTCResult`` objects, one per start configuration, in the
+        same order as ``start_configs``.
+
+    Example::
+
+        results = prrtc_plan_batch(
+            start_configs,                        # [B, dim]
+            goal_configs[:, None, :],             # [B, 1, dim]  — one goal each
+            max_iterations=500_000,
+            collision_context=cc,
+        )
+        solved_mask = [r.solved for r in results]
+    """
+    _load_and_register()
+
+    start_configs = jnp.atleast_2d(jnp.asarray(start_configs, dtype=jnp.float32))
+    batch_size = int(start_configs.shape[0])
+    dim = int(start_configs.shape[1])
+
+    # goal_configs must be [batch, num_goals, dim]
+    goal_configs_arr = jnp.asarray(goal_configs, dtype=jnp.float32)
+    if goal_configs_arr.ndim == 2:
+        # [batch, dim] → [batch, 1, dim]
+        goal_configs_arr = goal_configs_arr[:, None, :]
+    if goal_configs_arr.ndim != 3 or goal_configs_arr.shape[0] != batch_size:
+        raise ValueError(
+            f"goal_configs must have shape (batch, num_goals, dim), "
+            f"got {goal_configs_arr.shape} with batch_size={batch_size}"
+        )
+    num_goals = int(goal_configs_arr.shape[1])
+    # Contiguous [batch, num_goals, dim] tensor — the CUDA handler slices per problem
+    goal_batched = goal_configs_arr.reshape(batch_size, num_goals, dim)
+
+    if min_vals is None:
+        min_vals = jnp.ones(dim, dtype=jnp.float32) * -jnp.pi
+    if max_vals is None:
+        max_vals = jnp.ones(dim, dtype=jnp.float32) * jnp.pi
+    min_vals = jnp.asarray(min_vals, dtype=jnp.float32)
+    max_vals = jnp.asarray(max_vals, dtype=jnp.float32)
+
+    step_size = float(step_size)
+    if step_size <= 0.0:
+        raise ValueError("step_size must be > 0")
+
+    granularity = int(granularity)
+    if granularity < 1 or (granularity & (granularity - 1)) != 0:
+        raise ValueError(f"granularity must be a power of 2, got {granularity}")
+    if granularity > 64:
+        raise ValueError(f"granularity must be <= 64 (PRRTC_BLOCK_THREADS_MAX), got {granularity}")
+
+    # --- Build collision buffers (identical logic to prrtc_plan) ---
+    fk_twists        = jnp.zeros((0, 6),  dtype=jnp.float32)
+    fk_parent_tf     = jnp.zeros((0, 7),  dtype=jnp.float32)
+    fk_parent_idx    = jnp.zeros((0,),    dtype=jnp.int32)
+    fk_act_idx       = jnp.zeros((0,),    dtype=jnp.int32)
+    fk_mimic_mul     = jnp.zeros((0,),    dtype=jnp.float32)
+    fk_mimic_off     = jnp.zeros((0,),    dtype=jnp.float32)
+    fk_mimic_act_idx = jnp.zeros((0,),    dtype=jnp.int32)
+    fk_topo_inv      = jnp.zeros((0,),    dtype=jnp.int32)
+    sphere_link_idx  = jnp.zeros((0,),    dtype=jnp.int32)
+    sphere_local     = jnp.zeros((0, 3),  dtype=jnp.float32)
+    sphere_radius    = jnp.zeros((0,),    dtype=jnp.float32)
+    world_spheres    = jnp.zeros((0, 4),  dtype=jnp.float32)
+    world_capsules   = jnp.zeros((0, 7),  dtype=jnp.float32)
+    world_boxes      = jnp.zeros((0, 15), dtype=jnp.float32)
+    world_halfspaces = jnp.zeros((0, 6),  dtype=jnp.float32)
+    self_pairs       = jnp.zeros((0, 2),  dtype=jnp.int32)
+
+    required_keys = (
+        "fk_twists", "fk_parent_tf", "fk_parent_idx", "fk_act_idx",
+        "fk_mimic_mul", "fk_mimic_off", "fk_mimic_act_idx", "fk_topo_inv",
+        "sphere_link_idx", "sphere_local", "sphere_radius",
+    )
+
+    if collision_context is None and not allow_unsafe_no_collision:
+        raise ValueError(
+            "Collision-aware planning is the default. Provide collision_context "
+            "with required keys or set allow_unsafe_no_collision=True to opt out. "
+            f"Required keys: {required_keys}"
+        )
+
+    if collision_context is not None:
+        missing = [k for k in required_keys if k not in collision_context]
+        if missing:
+            raise ValueError(f"collision_context missing required keys: {missing}")
+        fk_twists        = jnp.asarray(collision_context["fk_twists"],        dtype=jnp.float32)
+        fk_parent_tf     = jnp.asarray(collision_context["fk_parent_tf"],     dtype=jnp.float32)
+        fk_parent_idx    = jnp.asarray(collision_context["fk_parent_idx"],    dtype=jnp.int32)
+        fk_act_idx       = jnp.asarray(collision_context["fk_act_idx"],       dtype=jnp.int32)
+        fk_mimic_mul     = jnp.asarray(collision_context["fk_mimic_mul"],     dtype=jnp.float32)
+        fk_mimic_off     = jnp.asarray(collision_context["fk_mimic_off"],     dtype=jnp.float32)
+        fk_mimic_act_idx = jnp.asarray(collision_context["fk_mimic_act_idx"], dtype=jnp.int32)
+        fk_topo_inv      = jnp.asarray(collision_context["fk_topo_inv"],      dtype=jnp.int32)
+        sphere_link_idx  = jnp.asarray(collision_context["sphere_link_idx"],  dtype=jnp.int32)
+        sphere_local     = jnp.asarray(collision_context["sphere_local"],     dtype=jnp.float32)
+        sphere_radius    = jnp.asarray(collision_context["sphere_radius"],    dtype=jnp.float32)
+        if "world_spheres"    in collision_context:
+            world_spheres    = jnp.asarray(collision_context["world_spheres"],    dtype=jnp.float32)
+        if "world_capsules"   in collision_context:
+            world_capsules   = jnp.asarray(collision_context["world_capsules"],   dtype=jnp.float32)
+        if "world_boxes"      in collision_context:
+            world_boxes      = jnp.asarray(collision_context["world_boxes"],      dtype=jnp.float32)
+        if "world_halfspaces" in collision_context:
+            world_halfspaces = jnp.asarray(collision_context["world_halfspaces"], dtype=jnp.float32)
+        if "self_pairs"       in collision_context:
+            self_pairs       = jnp.asarray(collision_context["self_pairs"],       dtype=jnp.int32)
+
+    # Output shapes — leading batch dimension on every buffer
+    result_shapes = (
+        jax.ShapeDtypeStruct((batch_size, dim, max_nodes), jnp.float32),  # tree_a_configs
+        jax.ShapeDtypeStruct((batch_size, dim, max_nodes), jnp.float32),  # tree_b_configs
+        jax.ShapeDtypeStruct((batch_size, max_nodes),      jnp.int32),    # tree_a_parents
+        jax.ShapeDtypeStruct((batch_size, max_nodes),      jnp.int32),    # tree_b_parents
+        jax.ShapeDtypeStruct((batch_size, 2),              jnp.int32),    # tree_sizes
+        jax.ShapeDtypeStruct((batch_size, 2),              jnp.int32),    # completed
+        jax.ShapeDtypeStruct((batch_size, 1),              jnp.int32),    # iter_count
+        jax.ShapeDtypeStruct((batch_size, 3),              jnp.int32),    # connection_info
+        jax.ShapeDtypeStruct((batch_size, 1),              jnp.int32),    # solved_flag
+        jax.ShapeDtypeStruct((batch_size,),                jnp.float32),  # kernel_time_ms
+    )
+
+    raw = jax.ffi.ffi_call("prrtc_planner_batch", result_shapes)(
+        start_configs,
+        goal_batched,
+        min_vals,
+        max_vals,
+        fk_twists, fk_parent_tf, fk_parent_idx, fk_act_idx,
+        fk_mimic_mul, fk_mimic_off, fk_mimic_act_idx, fk_topo_inv,
+        sphere_link_idx, sphere_local, sphere_radius,
+        world_spheres, world_capsules, world_boxes, world_halfspaces, self_pairs,
+        max_iterations=np.int32(max_iterations),
+        step_size=np.float32(step_size),
+        num_new_samples=np.int32(num_new_samples),
+        balance_mode=np.int32(balance_mode),
+        tree_ratio=np.float32(tree_ratio),
+        dynamic_domain=np.int32(1 if dynamic_domain else 0),
+        dd_alpha=np.float32(dd_alpha),
+        dd_radius=np.float32(dd_radius),
+        dd_min_radius=np.float32(dd_min_radius),
+        dim=np.int32(dim),
+        max_nodes=np.int32(max_nodes),
+        granularity=np.int32(granularity),
+    )
+
+    # Materialize all outputs from device before Python post-processing
+    raw = jax.device_get(raw)
+
+    results = []
+    for i in range(batch_size):
+        ta_cfg  = raw[0][i]   # [dim, max_nodes]
+        tb_cfg  = raw[1][i]   # [dim, max_nodes]
+        ta_par  = raw[2][i]   # [max_nodes]
+        tb_par  = raw[3][i]   # [max_nodes]
+        tsizes  = raw[4][i]   # [2]
+        conn    = raw[7][i]   # [3]
+        solved  = bool(raw[8][i][0] == 1)
+
+        if solved:
+            path = _trace_path(ta_cfg, tb_cfg, ta_par, tb_par, conn)
+            cost = float(jnp.sum(jnp.linalg.norm(jnp.diff(path, axis=0), axis=1)))
+        else:
+            path = None
+            cost = float("inf")
+
+        size_a = int(tsizes[0])
+        size_b = int(tsizes[1])
+        results.append(PRRTCResult(
+            solved=solved,
+            path=path,
+            tree_a_size=size_a,
+            tree_b_size=size_b,
+            iterations=int(raw[6][i][0]),
+            cost=cost,
+            kernel_time_ms=float(raw[9][i]),
+            tree_a_configs=ta_cfg[:, :size_a],
+            tree_b_configs=tb_cfg[:, :size_b],
+            tree_a_parents=ta_par[:size_a],
+            tree_b_parents=tb_par[:size_b],
+        ))
+
+    return results
 
 
 def prrtc_nearest_neighbor(

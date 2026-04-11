@@ -42,9 +42,6 @@ namespace ffi = xla::ffi;
 // because collision checks dominate and registers become the bottleneck above that).
 #define PRRTC_BLOCK_THREADS_MAX 64
 
-// Global state
-__device__ int d_prrtc_solved = 0;
-__device__ int d_prrtc_iterations = 0;
 
 __device__ __forceinline__ void prrtc_radius_shrink_atomic(
     float* radii,
@@ -111,9 +108,6 @@ __global__ void prrtc_init_kernel(
     const int tid = threadIdx.x;
 
     if (tid == 0 && blockIdx.x == 0) {
-        d_prrtc_solved = 0;
-        d_prrtc_iterations = 0;
-
         // Copy start configuration to tree A (root node)
         for (int d = 0; d < dim; d++) {
             tree_a_configs[d * max_nodes] = start_config[d];
@@ -388,16 +382,16 @@ __global__ void prrtc_planner_kernel(
     int local_iter = 0;
 
     while (true) {
-        if (atomicAdd(&d_prrtc_solved, 0) != 0) return;
+        if (atomicAdd(solved_out, 0) != 0) return;
 
         // --- Iteration accounting (per block, like pRRTC) ---
         ++local_iter;
         if (tid == 0 && local_iter > max_iterations) {
-            atomicCAS(&d_prrtc_solved, 0, -1);
+            atomicCAS(solved_out, 0, -1);
             atomicMax(iter_count, local_iter);
         }
         __syncthreads();
-        if (atomicAdd(&d_prrtc_solved, 0) != 0) return;
+        if (atomicAdd(solved_out, 0) != 0) return;
 
         // --- Sample one configuration and select tree side (tid == 0) ---
         if (tid == 0) {
@@ -537,7 +531,7 @@ __global__ void prrtc_planner_kernel(
         if (tid == 0) {
             const int idx = atomicAdd(&tree_sizes[t_tree_id], 1);
             if (idx >= max_nodes) {
-                atomicCAS(&d_prrtc_solved, 0, -1);
+                atomicCAS(solved_out, 0, -1);
                 new_idx_sh = -1;
             } else {
                 new_idx_sh = idx;
@@ -550,7 +544,7 @@ __global__ void prrtc_planner_kernel(
         }
         __syncthreads();
 
-        if (new_idx_sh < 0) { if (atomicAdd(&d_prrtc_solved, 0) != 0) return; continue; }
+        if (new_idx_sh < 0) { if (atomicAdd(solved_out, 0) != 0) return; continue; }
 
         // Parallel write: each thread writes one dimension (like pRRTC's tid < dim writes)
         if (tid < dim) t_cfgs_w[tid * max_nodes + new_idx_sh] = cfg_candidate_sh[tid];
@@ -629,7 +623,7 @@ __global__ void prrtc_planner_kernel(
             if (tid == 0) {
                 const int eidx = atomicAdd(&tree_sizes[t_tree_id], 1);
                 if (eidx >= max_nodes) {
-                    atomicCAS(&d_prrtc_solved, 0, -1);
+                    atomicCAS(solved_out, 0, -1);
                     ext_idx_sh = -1;
                 } else {
                     ext_idx_sh = eidx;
@@ -652,7 +646,7 @@ __global__ void prrtc_planner_kernel(
 
         // --- Connection found ---
         if (!extension_failed) {
-            if (atomicCAS(&d_prrtc_solved, 0, 1) == 0) {
+            if (atomicCAS(solved_out, 0, 1) == 0) {
                 // extension_parent_sh = last node added in t_tree (at the connect point)
                 // connect_nearest_idx_sh = NN in o_tree
                 if (t_tree_id == 0) {
@@ -669,7 +663,7 @@ __global__ void prrtc_planner_kernel(
             return;
         }
 
-        if (atomicAdd(&d_prrtc_solved, 0) != 0) return;
+        if (atomicAdd(solved_out, 0) != 0) return;
     }
 }
 
@@ -705,6 +699,7 @@ static ffi::Error PrrtcPlannerImpl(
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> iter_count,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> connection_info,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> solved_flag,
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> kernel_time_ms,
     int max_iterations,
     float step_size,
     int num_new_samples,
@@ -862,6 +857,31 @@ static ffi::Error PrrtcPlannerImpl(
     // independent explorer — matching pRRTC's num_new_configs-block launch pattern.
     // Block size = granularity (must be power of 2, capped at PRRTC_BLOCK_THREADS_MAX).
     // All shared memory is statically declared; no dynamic shared memory needed.
+    cudaEvent_t kernel_start = nullptr;
+    cudaEvent_t kernel_end = nullptr;
+    e = cudaEventCreate(&kernel_start);
+    if (e != cudaSuccess) {
+        cudaFree(tree_a_radii);
+        cudaFree(tree_b_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+    e = cudaEventCreate(&kernel_end);
+    if (e != cudaSuccess) {
+        cudaEventDestroy(kernel_start);
+        cudaFree(tree_a_radii);
+        cudaFree(tree_b_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    e = cudaEventRecord(kernel_start, stream);
+    if (e != cudaSuccess) {
+        cudaEventDestroy(kernel_start);
+        cudaEventDestroy(kernel_end);
+        cudaFree(tree_a_radii);
+        cudaFree(tree_b_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
     prrtc_planner_kernel<<<num_new_samples, granularity, 0, stream>>>(
         tree_a_configs->typed_data(),
         tree_b_configs->typed_data(),
@@ -893,16 +913,329 @@ static ffi::Error PrrtcPlannerImpl(
 
     e = cudaGetLastError();
     if (e != cudaSuccess) {
+        cudaEventDestroy(kernel_start);
+        cudaEventDestroy(kernel_end);
         cudaFree(tree_a_radii);
         cudaFree(tree_b_radii);
         return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
     }
+
+    e = cudaEventRecord(kernel_end, stream);
+    if (e != cudaSuccess) {
+        cudaEventDestroy(kernel_start);
+        cudaEventDestroy(kernel_end);
+        cudaFree(tree_a_radii);
+        cudaFree(tree_b_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    e = cudaEventSynchronize(kernel_end);
+    if (e != cudaSuccess) {
+        cudaEventDestroy(kernel_start);
+        cudaEventDestroy(kernel_end);
+        cudaFree(tree_a_radii);
+        cudaFree(tree_b_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    float elapsed_ms = 0.0f;
+    e = cudaEventElapsedTime(&elapsed_ms, kernel_start, kernel_end);
+    if (e != cudaSuccess) {
+        cudaEventDestroy(kernel_start);
+        cudaEventDestroy(kernel_end);
+        cudaFree(tree_a_radii);
+        cudaFree(tree_b_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    e = cudaMemcpyAsync(
+        kernel_time_ms->typed_data(),
+        &elapsed_ms,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream
+    );
+    if (e != cudaSuccess) {
+        cudaEventDestroy(kernel_start);
+        cudaEventDestroy(kernel_end);
+        cudaFree(tree_a_radii);
+        cudaFree(tree_b_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    cudaEventDestroy(kernel_start);
+    cudaEventDestroy(kernel_end);
 
     cudaFree(tree_a_radii);
     cudaFree(tree_b_radii);
 
     return ffi::Error::Success();
 }
+
+// XLA FFI handler for pRRTC batch planner.
+// Accepts start_configs [batch, dim] and launches each problem on its own
+// child CUDA stream so all batch elements run concurrently on the GPU.
+// Results have a leading batch dimension: tree_*_configs [batch, dim, max_nodes],
+// tree_*_parents [batch, max_nodes], tree_sizes/completed [batch, 2],
+// iter_count/solved_flag [batch, 1], connection_info [batch, 3].
+static ffi::Error PrrtcPlannerBatchImpl(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::DataType::F32> start_configs,   // [batch, dim]
+    ffi::Buffer<ffi::DataType::F32> goal_configs,    // [num_goals, dim]
+    ffi::Buffer<ffi::DataType::F32> min_vals,        // [dim]
+    ffi::Buffer<ffi::DataType::F32> max_vals,        // [dim]
+    ffi::Buffer<ffi::DataType::F32> fk_twists,
+    ffi::Buffer<ffi::DataType::F32> fk_parent_tf,
+    ffi::Buffer<ffi::DataType::S32> fk_parent_idx,
+    ffi::Buffer<ffi::DataType::S32> fk_act_idx,
+    ffi::Buffer<ffi::DataType::F32> fk_mimic_mul,
+    ffi::Buffer<ffi::DataType::F32> fk_mimic_off,
+    ffi::Buffer<ffi::DataType::S32> fk_mimic_act_idx,
+    ffi::Buffer<ffi::DataType::S32> fk_topo_inv,
+    ffi::Buffer<ffi::DataType::S32> sphere_link_idx,
+    ffi::Buffer<ffi::DataType::F32> sphere_local,
+    ffi::Buffer<ffi::DataType::F32> sphere_radius,
+    ffi::Buffer<ffi::DataType::F32> world_spheres,
+    ffi::Buffer<ffi::DataType::F32> world_capsules,
+    ffi::Buffer<ffi::DataType::F32> world_boxes,
+    ffi::Buffer<ffi::DataType::F32> world_halfspaces,
+    ffi::Buffer<ffi::DataType::S32> self_pairs,
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_a_configs,   // [batch, dim, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_b_configs,   // [batch, dim, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_a_parents,   // [batch, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_b_parents,   // [batch, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_sizes,       // [batch, 2]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> completed,        // [batch, 2]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> iter_count,       // [batch, 1]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> connection_info,  // [batch, 3]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> solved_flag,      // [batch, 1]
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> kernel_time_ms,   // [batch]
+    int max_iterations,
+    float step_size,
+    int num_new_samples,
+    int balance_mode,
+    float tree_ratio,
+    int dynamic_domain,
+    float dd_alpha,
+    float dd_radius,
+    float dd_min_radius,
+    int dim,
+    int max_nodes,
+    int granularity
+) {
+    const int batch     = static_cast<int>(start_configs.dimensions()[0]);
+    // goal_configs is [batch, num_goals, dim]; each problem has its own goal slice
+    const int num_goals = static_cast<int>(goal_configs.dimensions()[1]);
+    const int n_joints        = static_cast<int>(fk_parent_idx.dimensions().size() == 0 ? 0 : fk_parent_idx.dimensions()[0]);
+    const int n_robot_spheres = static_cast<int>(sphere_link_idx.dimensions().size() == 0 ? 0 : sphere_link_idx.dimensions()[0]);
+    const int n_world_spheres    = static_cast<int>(world_spheres.dimensions().size()    == 0 ? 0 : world_spheres.dimensions()[0]);
+    const int n_world_capsules   = static_cast<int>(world_capsules.dimensions().size()   == 0 ? 0 : world_capsules.dimensions()[0]);
+    const int n_world_boxes      = static_cast<int>(world_boxes.dimensions().size()      == 0 ? 0 : world_boxes.dimensions()[0]);
+    const int n_world_halfspaces = static_cast<int>(world_halfspaces.dimensions().size() == 0 ? 0 : world_halfspaces.dimensions()[0]);
+    const int n_self_pairs       = static_cast<int>(self_pairs.dimensions().size()       == 0 ? 0 : self_pairs.dimensions()[0]);
+
+    CollisionContext collision_ctx;
+    collision_ctx.twists        = fk_twists.typed_data();
+    collision_ctx.parent_tf     = fk_parent_tf.typed_data();
+    collision_ctx.parent_idx    = fk_parent_idx.typed_data();
+    collision_ctx.act_idx       = fk_act_idx.typed_data();
+    collision_ctx.mimic_mul     = fk_mimic_mul.typed_data();
+    collision_ctx.mimic_off     = fk_mimic_off.typed_data();
+    collision_ctx.mimic_act_idx = fk_mimic_act_idx.typed_data();
+    collision_ctx.topo_inv      = fk_topo_inv.typed_data();
+    collision_ctx.sphere_link_idx   = sphere_link_idx.typed_data();
+    collision_ctx.sphere_local      = sphere_local.typed_data();
+    collision_ctx.sphere_radius     = sphere_radius.typed_data();
+    collision_ctx.world_spheres     = world_spheres.typed_data();
+    collision_ctx.world_capsules    = world_capsules.typed_data();
+    collision_ctx.world_boxes       = world_boxes.typed_data();
+    collision_ctx.world_halfspaces  = world_halfspaces.typed_data();
+    collision_ctx.self_pairs        = self_pairs.typed_data();
+    collision_ctx.n_joints          = n_joints;
+    collision_ctx.n_act             = dim;
+    collision_ctx.n_robot_spheres   = n_robot_spheres;
+    collision_ctx.n_world_spheres   = n_world_spheres;
+    collision_ctx.n_world_capsules  = n_world_capsules;
+    collision_ctx.n_world_boxes     = n_world_boxes;
+    collision_ctx.n_world_halfspaces = n_world_halfspaces;
+    collision_ctx.n_self_pairs      = n_self_pairs;
+    collision_ctx.enabled = (n_joints > 0 && n_robot_spheres > 0 &&
+        (n_world_spheres > 0 || n_world_capsules > 0 || n_world_boxes > 0 ||
+         n_world_halfspaces > 0 || n_self_pairs > 0)) ? 1 : 0;
+
+    // Allocate radii arrays for all problems in one shot
+    float* all_ta_radii = nullptr;
+    float* all_tb_radii = nullptr;
+    cudaError_t e = cudaMalloc(&all_ta_radii, sizeof(float) * max_nodes * batch);
+    if (e != cudaSuccess)
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    e = cudaMalloc(&all_tb_radii, sizeof(float) * max_nodes * batch);
+    if (e != cudaSuccess) {
+        cudaFree(all_ta_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    // One child stream per problem — these run concurrently on the GPU
+    cudaStream_t* child_streams = new cudaStream_t[batch];
+    for (int b = 0; b < batch; ++b)
+        cudaStreamCreateWithFlags(&child_streams[b], cudaStreamNonBlocking);
+    cudaEvent_t* kernel_start_events = new cudaEvent_t[batch];
+    cudaEvent_t* kernel_end_events = new cudaEvent_t[batch];
+    for (int b = 0; b < batch; ++b) {
+        cudaEventCreate(&kernel_start_events[b]);
+        cudaEventCreate(&kernel_end_events[b]);
+    }
+
+    const int threads_fill = 16;
+    const int blocks_fill  = (max_nodes + threads_fill - 1) / threads_fill;
+
+    // Constants written once; cudaMemcpyAsync with pageable host memory is
+    // synchronous from the host side, so local-variable addresses are safe.
+    const int init_sizes[2]   = {1, num_goals};
+    const int init_conn[3]    = {-1, -1, -1};
+    const int zero            = 0;
+
+    for (int b = 0; b < batch; ++b) {
+        cudaStream_t s = child_streams[b];
+
+        float* start_b   = start_configs.typed_data()        + b * dim;
+        float* ta_cfg_b  = tree_a_configs->typed_data()      + (size_t)b * dim * max_nodes;
+        float* tb_cfg_b  = tree_b_configs->typed_data()      + (size_t)b * dim * max_nodes;
+        int*   ta_par_b  = tree_a_parents->typed_data()      + b * max_nodes;
+        int*   tb_par_b  = tree_b_parents->typed_data()      + b * max_nodes;
+        int*   tsizes_b  = tree_sizes->typed_data()          + b * 2;
+        int*   comp_b    = completed->typed_data()           + b * 2;
+        int*   iter_b    = iter_count->typed_data()          + b * 1;
+        int*   conn_b    = connection_info->typed_data()     + b * 3;
+        int*   solved_b  = solved_flag->typed_data()         + b * 1;
+        float* ta_rad_b  = all_ta_radii                      + b * max_nodes;
+        float* tb_rad_b  = all_tb_radii                      + b * max_nodes;
+
+        cudaMemsetAsync(ta_cfg_b, 0,  sizeof(float) * dim * max_nodes, s);
+        cudaMemsetAsync(tb_cfg_b, 0,  sizeof(float) * dim * max_nodes, s);
+        cudaMemsetAsync(ta_par_b, -1, sizeof(int)   * max_nodes,       s);
+        cudaMemsetAsync(tb_par_b, -1, sizeof(int)   * max_nodes,       s);
+
+        cudaMemcpyAsync(tsizes_b, init_sizes, sizeof(int) * 2, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(comp_b,   init_sizes, sizeof(int) * 2, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(iter_b,   &zero,      sizeof(int),     cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(conn_b,   init_conn,  sizeof(int) * 3, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(solved_b, &zero,      sizeof(int),     cudaMemcpyHostToDevice, s);
+
+        prrtc_fill_float_kernel<<<blocks_fill, threads_fill, 0, s>>>(ta_rad_b, FLT_MAX, max_nodes);
+        prrtc_fill_float_kernel<<<blocks_fill, threads_fill, 0, s>>>(tb_rad_b, FLT_MAX, max_nodes);
+
+        const float* goals_b = goal_configs.typed_data() + b * num_goals * dim;
+        prrtc_init_kernel<<<1, 32, 0, s>>>(
+            start_b, goals_b,
+            ta_cfg_b, tb_cfg_b, ta_par_b, tb_par_b,
+            num_goals, dim, max_nodes
+        );
+
+        cudaEventRecord(kernel_start_events[b], s);
+        prrtc_planner_kernel<<<num_new_samples, granularity, 0, s>>>(
+            ta_cfg_b, tb_cfg_b, ta_par_b, tb_par_b,
+            ta_rad_b, tb_rad_b,
+            min_vals.typed_data(), max_vals.typed_data(),
+            tsizes_b, comp_b, iter_b, conn_b, solved_b,
+            collision_ctx,
+            max_iterations, step_size, num_new_samples,
+            balance_mode, tree_ratio, dynamic_domain,
+            dd_alpha, dd_radius, dd_min_radius,
+            dim, max_nodes, granularity
+        );
+        cudaEventRecord(kernel_end_events[b], s);
+    }
+
+    float* host_kernel_times = new float[batch];
+    for (int b = 0; b < batch; ++b) {
+        cudaEventSynchronize(kernel_end_events[b]);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, kernel_start_events[b], kernel_end_events[b]);
+        host_kernel_times[b] = elapsed_ms;
+    }
+    cudaMemcpyAsync(
+        kernel_time_ms->typed_data(),
+        host_kernel_times,
+        sizeof(float) * batch,
+        cudaMemcpyHostToDevice,
+        stream
+    );
+    delete[] host_kernel_times;
+
+    // Record an event on each child stream, then make the XLA stream wait on
+    // all of them before returning — this is the standard CUDA pattern for
+    // fan-out/fan-in across non-blocking child streams.
+    cudaEvent_t* events = new cudaEvent_t[batch];
+    for (int b = 0; b < batch; ++b) {
+        cudaEventCreateWithFlags(&events[b], cudaEventDisableTiming);
+        cudaEventRecord(events[b], child_streams[b]);
+        cudaStreamWaitEvent(stream, events[b], 0);
+    }
+
+    for (int b = 0; b < batch; ++b) {
+        cudaEventDestroy(events[b]);
+        cudaEventDestroy(kernel_start_events[b]);
+        cudaEventDestroy(kernel_end_events[b]);
+        cudaStreamDestroy(child_streams[b]);
+    }
+    delete[] events;
+    delete[] kernel_start_events;
+    delete[] kernel_end_events;
+    delete[] child_streams;
+    cudaFree(all_ta_radii);
+    cudaFree(all_tb_radii);
+
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    PrrtcPlannerBatchFfi, PrrtcPlannerBatchImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // start_configs [batch, dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // goal_configs [batch, num_goals, dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // min_vals [dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // max_vals [dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_twists
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_parent_tf
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_parent_idx
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_act_idx
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_mimic_mul
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_mimic_off
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_mimic_act_idx
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_topo_inv
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // sphere_link_idx
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // sphere_local
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // sphere_radius
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_spheres
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_capsules
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_boxes
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_halfspaces
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pairs
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_a_configs [batch, dim, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_b_configs [batch, dim, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_a_parents [batch, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_b_parents [batch, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_sizes [batch, 2]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // completed [batch, 2]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // iter_count [batch, 1]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // connection_info [batch, 3]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // solved_flag [batch, 1]
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()  // kernel_time_ms [batch]
+        .Attr<int>("max_iterations")
+        .Attr<float>("step_size")
+        .Attr<int>("num_new_samples")
+        .Attr<int>("balance_mode")
+        .Attr<float>("tree_ratio")
+        .Attr<int>("dynamic_domain")
+        .Attr<float>("dd_alpha")
+        .Attr<float>("dd_radius")
+        .Attr<float>("dd_min_radius")
+        .Attr<int>("dim")
+        .Attr<int>("max_nodes")
+        .Attr<int>("granularity")
+);
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     PrrtcPlannerFfi, PrrtcPlannerImpl,
@@ -937,6 +1270,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // iter_count [1]
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // connection_info [3]
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // solved_flag [1]
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()  // kernel_time_ms [1]
         .Attr<int>("max_iterations")
         .Attr<float>("step_size")
         .Attr<int>("num_new_samples")
