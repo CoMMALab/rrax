@@ -8,8 +8,6 @@ import importlib.util
 import json
 import pickle
 import sys
-import tarfile
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -69,8 +67,12 @@ from pyronot.collision._robot_collision import RobotCollisionSpherized
 ROOT = Path(__file__).resolve().parent
 RESOURCES = ROOT / "pyronot" / "resources"
 PRRTC_ROOT = ROOT / "cuda-rrtc" / "jax"
-PRRTC_SCRIPTS = ROOT / "pRRTC" / "scripts"
 SOLVE_BATCH_CHUNK_SIZE = 25
+STEP_SIZE_BY_ROBOT = {
+    "panda": 0.5,
+    "fetch": 0.6,
+    "baxter": 0.25,
+}
 
 
 def _load_module(module_name: str, module_path: Path):
@@ -87,51 +89,17 @@ PRRTC_UTILS = _load_module("cuda_rrtc_utils", PRRTC_ROOT / "utils.py")
 
 
 def load_robot_dataset(robot: str) -> dict[str, Any]:
-    """Load MBM dataset from pyronot/resources, with robust fallbacks for baxter."""
+    """Load MBM dataset from pyronot/resources."""
     robot_dir = RESOURCES / robot
     pkl_path = robot_dir / "problems.pkl"
-    json_path = robot_dir / "problems.json"
-    tar_path = robot_dir / "problems.tar.bz2"
 
     if pkl_path.exists():
         with open(pkl_path, "rb") as f:
             return pickle.load(f)
 
-    if json_path.exists():
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "problems" in data:
-            return data
-
-    if tar_path.exists():
-        with tempfile.TemporaryDirectory(prefix=f"{robot}_mbm_") as tmpdir:
-            with tarfile.open(tar_path, mode="r:bz2") as tf:
-                tf.extractall(tmpdir)
-            extracted = Path(tmpdir)
-            pkl_candidates = list(extracted.rglob("problems.pkl"))
-            json_candidates = list(extracted.rglob("problems.json"))
-
-            if pkl_candidates:
-                with open(pkl_candidates[0], "rb") as f:
-                    return pickle.load(f)
-
-            if json_candidates:
-                with open(json_candidates[0], "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and "problems" in data:
-                    return data
-
-    fallback = PRRTC_SCRIPTS / f"{robot}_problems.json"
-    if fallback.exists():
-        print(
-            f"Warning: no parsed problems file found in {robot_dir}; "
-            f"falling back to {fallback}"
-        )
-        with open(fallback, "r", encoding="utf-8") as f:
-            return json.load(f)
-
     raise RuntimeError(
-        f"Unable to load MBM dataset for robot '{robot}' from {robot_dir}"
+        f"Unable to load MBM dataset for robot '{robot}' from {robot_dir}; "
+        "expected problems.pkl"
     )
 
 
@@ -395,7 +363,6 @@ def parse_args() -> argparse.Namespace:
         help="Robots to evaluate",
     )
     parser.add_argument("--max-iterations", type=int, default=5000)
-    parser.add_argument("--step-size", type=float, default=0.5)
     parser.add_argument("--num-new-samples", type=int, default=64)
     parser.add_argument("--granularity", type=int, default=16)
     parser.add_argument("--max-nodes", type=int, default=1_000_000)
@@ -446,8 +413,10 @@ def main() -> None:
     total = 0
     valid = 0
     failed = 0
+    per_robot_counts: dict[str, tuple[int, int, int]] = {}
 
     for robot in args.robots:
+        robot_step_size = STEP_SIZE_BY_ROBOT[robot]
         (
             robot_results,
             robot_total,
@@ -456,7 +425,7 @@ def main() -> None:
         ) = evaluate_robot(
             robot,
             max_iterations=args.max_iterations,
-            step_size=args.step_size,
+            step_size=robot_step_size,
             num_new_samples=args.num_new_samples,
             granularity=args.granularity,
             max_nodes=args.max_nodes,
@@ -477,6 +446,7 @@ def main() -> None:
         total += robot_total
         valid += robot_valid
         failed += robot_failed
+        per_robot_counts[robot] = (robot_valid - robot_failed, robot_valid, robot_total)
 
     if not all_results:
         raise RuntimeError("No solved plans were collected; cannot summarize results")
@@ -532,12 +502,61 @@ def main() -> None:
         )
     )
 
+    for robot_name, robot_df in df.groupby("robot", sort=True):
+        robot_time_stats = robot_df[
+            [
+                "planning_time",
+                "simplification_time",
+                "total_time",
+                "planning_iterations",
+                "avg_time_per_iteration",
+            ]
+        ].describe(percentiles=[0.25, 0.5, 0.75, 0.95])
+        robot_time_stats.drop(index=["count"], inplace=True)
+
+        robot_cost_stats = robot_df[["initial_path_cost", "simplified_path_cost"]].describe(
+            percentiles=[0.25, 0.5, 0.75, 0.95]
+        )
+        robot_cost_stats.drop(index=["count"], inplace=True)
+
+        print()
+        print(f"Per-robot breakdown: {robot_name}")
+        print(
+            tabulate(
+                robot_time_stats,
+                headers=[
+                    "Planning Time (us)",
+                    "Simplification Time (us)",
+                    "Total Time (us)",
+                    "Planning Iters.",
+                    "Time per Iter. (us)",
+                ],
+                tablefmt="github",
+                **({"floatfmt": ".6f"} if HAS_TABULATE else {}),
+            )
+        )
+
+        print(
+            tabulate(
+                robot_cost_stats,
+                headers=[
+                    " Initial Cost (L2)",
+                    "    Simplified Cost (L2)",
+                ],
+                tablefmt="github",
+                **({"floatfmt": ".6f"} if HAS_TABULATE else {}),
+            )
+        )
+
     tock = time.perf_counter()
 
     print(f"Timing source for planning_time: {args.timing_source}")
     print(f"JIT tracing for batched pRRTC dispatch: {args.jit_trace}")
     print(f"Configured solve batch size: {args.solve_batch_size}")
     print(f"Solved / Valid / Total # Problems: {valid - failed} / {valid} / {total}")
+    for robot in args.robots:
+        solved_robot, valid_robot, total_robot = per_robot_counts[robot]
+        print(f"  {robot}: {solved_robot} / {valid_robot} / {total_robot}")
     print(f"Completed all problems in {df['total_time'].sum() / 1000:.3f} milliseconds")
     print(f"Total time including Python overhead: {(tock - tick) * 1000:.3f} milliseconds")
 
