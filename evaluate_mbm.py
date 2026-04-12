@@ -171,6 +171,7 @@ def evaluate_robot(
     dd_min_radius: float,
     warmup: bool,
     timing_source: str,
+    jit_trace: bool,
     max_problems_per_set: int,
     print_failures: bool,
 ):
@@ -233,6 +234,7 @@ def evaluate_robot(
                 min_vals=lo,
                 max_vals=hi,
                 collision_context=collision_context,
+                jit_trace=jit_trace,
             )
 
             if not did_warmup:
@@ -313,6 +315,18 @@ def parse_args() -> argparse.Namespace:
         default="host",
         help="Use host wall time (default) or kernel-reported time for planning_time.",
     )
+    parser.add_argument(
+        "--jit-trace",
+        action="store_true",
+        default=True,
+        help="Use cached jax.jit tracing for pRRTC FFI dispatch.",
+    )
+    parser.add_argument(
+        "--no-jit-trace",
+        action="store_false",
+        dest="jit_trace",
+        help="Disable jax.jit tracing and call the FFI dispatch path directly.",
+    )
     parser.add_argument("--max-problems-per-set", type=int, default=0)
     parser.add_argument("--print-failures", action="store_true")
     return parser.parse_args()
@@ -349,6 +363,7 @@ def main() -> None:
             dd_min_radius=args.dd_min_radius,
             warmup=args.warmup,
             timing_source=args.timing_source,
+            jit_trace=args.jit_trace,
             max_problems_per_set=args.max_problems_per_set,
             print_failures=args.print_failures,
         )
@@ -415,6 +430,7 @@ def main() -> None:
     tock = time.perf_counter()
 
     print(f"Timing source for planning_time: {args.timing_source}")
+    print(f"JIT tracing for pRRTC dispatch: {args.jit_trace}")
     print(f"Solved / Valid / Total # Problems: {valid - failed} / {valid} / {total}")
     print(f"Completed all problems in {df['total_time'].sum() / 1000:.3f} milliseconds")
     print(f"Total time including Python overhead: {(tock - tick) * 1000:.3f} milliseconds")

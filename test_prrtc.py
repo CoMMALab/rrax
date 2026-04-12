@@ -53,6 +53,22 @@ RESOURCE_ROOT = Path("/home/scoumar/Work/rrax/pyronot/resources")
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
 
 
+def _slice_collision_context(base_ctx: dict, *, world_spheres_keep: int, self_pairs_keep: int) -> dict:
+    """Clone collision context while trimming selected world/self geometry arrays."""
+    out = dict(base_ctx)
+
+    ws = np.asarray(base_ctx.get("world_spheres", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
+    sp = np.asarray(base_ctx.get("self_pairs", np.zeros((0, 2), dtype=np.int32)), dtype=np.int32)
+
+    keep_ws = max(0, min(int(world_spheres_keep), int(ws.shape[0])))
+    keep_sp = max(0, min(int(self_pairs_keep), int(sp.shape[0])))
+
+    out["world_spheres"] = ws[:keep_ws]
+    out["self_pairs"] = sp[:keep_sp]
+
+    return out
+
+
 def validate_path_collision(robot, robot_coll, path, world_obstacles):
     """Validate solved path against full pyronot collision model."""
     path_np = np.asarray(path, dtype=np.float32)
@@ -228,11 +244,24 @@ def main():
     parser.add_argument("--no-viz", action="store_true", help="Disable Viser visualization")
     parser.add_argument("--vamp-problem", default="bookshelf_tall", help="VAMP problem name")
     parser.add_argument("--vamp-index", type=int, default=1, help="VAMP problem index")
+    parser.add_argument(
+        "--jit-trace",
+        action="store_true",
+        default=True,
+        help="Use cached jax.jit tracing for pRRTC FFI dispatch.",
+    )
+    parser.add_argument(
+        "--no-jit-trace",
+        action="store_false",
+        dest="jit_trace",
+        help="Disable jax.jit tracing and call the FFI dispatch path directly.",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
     print("Testing pRRTC with PyRoNot VAMP problem")
     print("=" * 70)
+    print(f"JIT tracing for pRRTC dispatch: {args.jit_trace}")
 
     if not PANDA_URDF.exists():
         print(f"ERROR: URDF not found at {PANDA_URDF}")
@@ -334,6 +363,7 @@ def main():
                 min_vals=jnp.array(lo, dtype=jnp.float32),
                 max_vals=jnp.array(hi, dtype=jnp.float32),
                 collision_context=collision_context,
+                jit_trace=args.jit_trace,
             )
             # First call pays setup overhead (e.g., FFI target registration/JIT plumbing).
             _ = prrtc_plan(**single_plan_kwargs)
@@ -398,6 +428,23 @@ def main():
                 grep = config_collision_report(robot, robot_coll, goals_np[i], obstacles)
                 retries += 1
 
+        max_ws = int(collision_context.get("world_spheres", np.empty((0, 4), dtype=np.float32)).shape[0])
+        max_sp = int(collision_context.get("self_pairs", np.empty((0, 2), dtype=np.int32)).shape[0])
+        per_problem_contexts = []
+        for i in range(batch_size):
+            if i % 2 == 0:
+                per_problem_contexts.append(collision_context)
+            else:
+                ws_keep = max(0, max_ws - 1)
+                sp_keep = max(0, max_sp - 1)
+                per_problem_contexts.append(
+                    _slice_collision_context(
+                        collision_context,
+                        world_spheres_keep=ws_keep,
+                        self_pairs_keep=sp_keep,
+                    )
+                )
+
         batch_plan_kwargs = dict(
             start_configs=jnp.array(starts_np),
             goal_configs=jnp.array(goals_np[:, None, :]),  # [batch, 1, dim] — one goal per problem
@@ -407,10 +454,15 @@ def main():
             dynamic_domain=False,
             min_vals=jnp.array(lo, dtype=jnp.float32),
             max_vals=jnp.array(hi, dtype=jnp.float32),
-            collision_context=collision_context,
+            collision_context=per_problem_contexts,
+            jit_trace=args.jit_trace,
         )
         _ = prrtc_plan_batch(**batch_plan_kwargs)
         results = prrtc_plan_batch(**batch_plan_kwargs)
+        print(
+            "  Batch collision contexts: mixed per-problem "
+            f"(unique_world_spheres={[c.get('world_spheres', np.empty((0,4))).shape[0] for c in per_problem_contexts]})"
+        )
         kernel_times = [r.kernel_time_ms for r in results if r.kernel_time_ms is not None]
         if kernel_times:
             total_ms = float(np.sum(np.asarray(kernel_times, dtype=np.float32)))

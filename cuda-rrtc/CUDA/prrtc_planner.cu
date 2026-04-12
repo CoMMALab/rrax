@@ -1189,6 +1189,340 @@ static ffi::Error PrrtcPlannerBatchImpl(
     return ffi::Error::Success();
 }
 
+// XLA FFI handler for pRRTC batch planner with per-problem collision contexts.
+// World geometry/self-pairs are provided as padded batched tensors with per-
+// problem count vectors to avoid Python-side fanout by context.
+static ffi::Error PrrtcPlannerBatchCtxImpl(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::DataType::F32> start_configs,   // [batch, dim]
+    ffi::Buffer<ffi::DataType::F32> goal_configs,    // [batch, num_goals, dim]
+    ffi::Buffer<ffi::DataType::F32> min_vals,        // [dim]
+    ffi::Buffer<ffi::DataType::F32> max_vals,        // [dim]
+    ffi::Buffer<ffi::DataType::F32> fk_twists,
+    ffi::Buffer<ffi::DataType::F32> fk_parent_tf,
+    ffi::Buffer<ffi::DataType::S32> fk_parent_idx,
+    ffi::Buffer<ffi::DataType::S32> fk_act_idx,
+    ffi::Buffer<ffi::DataType::F32> fk_mimic_mul,
+    ffi::Buffer<ffi::DataType::F32> fk_mimic_off,
+    ffi::Buffer<ffi::DataType::S32> fk_mimic_act_idx,
+    ffi::Buffer<ffi::DataType::S32> fk_topo_inv,
+    ffi::Buffer<ffi::DataType::S32> sphere_link_idx,
+    ffi::Buffer<ffi::DataType::F32> sphere_local,
+    ffi::Buffer<ffi::DataType::F32> sphere_radius,
+    ffi::Buffer<ffi::DataType::F32> world_spheres_batched,    // [batch, max_ws, 4]
+    ffi::Buffer<ffi::DataType::F32> world_capsules_batched,   // [batch, max_wc, 7]
+    ffi::Buffer<ffi::DataType::F32> world_boxes_batched,      // [batch, max_wb, 15]
+    ffi::Buffer<ffi::DataType::F32> world_halfspaces_batched, // [batch, max_wh, 6]
+    ffi::Buffer<ffi::DataType::S32> self_pairs_batched,       // [batch, max_sp, 2]
+    ffi::Buffer<ffi::DataType::S32> world_spheres_count,      // [batch]
+    ffi::Buffer<ffi::DataType::S32> world_capsules_count,     // [batch]
+    ffi::Buffer<ffi::DataType::S32> world_boxes_count,        // [batch]
+    ffi::Buffer<ffi::DataType::S32> world_halfspaces_count,   // [batch]
+    ffi::Buffer<ffi::DataType::S32> self_pairs_count,         // [batch]
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_a_configs,   // [batch, dim, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_b_configs,   // [batch, dim, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_a_parents,   // [batch, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_b_parents,   // [batch, max_nodes]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_sizes,       // [batch, 2]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> completed,        // [batch, 2]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> iter_count,       // [batch, 1]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> connection_info,  // [batch, 3]
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> solved_flag,      // [batch, 1]
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> kernel_time_ms,   // [batch]
+    int max_iterations,
+    float step_size,
+    int num_new_samples,
+    int balance_mode,
+    float tree_ratio,
+    int dynamic_domain,
+    float dd_alpha,
+    float dd_radius,
+    float dd_min_radius,
+    int dim,
+    int max_nodes,
+    int granularity
+) {
+    const int batch = static_cast<int>(start_configs.dimensions()[0]);
+    const int num_goals = static_cast<int>(goal_configs.dimensions()[1]);
+    const int n_joints = static_cast<int>(fk_parent_idx.dimensions().size() == 0 ? 0 : fk_parent_idx.dimensions()[0]);
+    const int n_robot_spheres = static_cast<int>(sphere_link_idx.dimensions().size() == 0 ? 0 : sphere_link_idx.dimensions()[0]);
+
+    const int max_world_spheres = static_cast<int>(world_spheres_batched.dimensions().size() < 2 ? 0 : world_spheres_batched.dimensions()[1]);
+    const int max_world_capsules = static_cast<int>(world_capsules_batched.dimensions().size() < 2 ? 0 : world_capsules_batched.dimensions()[1]);
+    const int max_world_boxes = static_cast<int>(world_boxes_batched.dimensions().size() < 2 ? 0 : world_boxes_batched.dimensions()[1]);
+    const int max_world_halfspaces = static_cast<int>(world_halfspaces_batched.dimensions().size() < 2 ? 0 : world_halfspaces_batched.dimensions()[1]);
+    const int max_self_pairs = static_cast<int>(self_pairs_batched.dimensions().size() < 2 ? 0 : self_pairs_batched.dimensions()[1]);
+
+    int* host_world_spheres_count = new int[batch];
+    int* host_world_capsules_count = new int[batch];
+    int* host_world_boxes_count = new int[batch];
+    int* host_world_halfspaces_count = new int[batch];
+    int* host_self_pairs_count = new int[batch];
+    cudaError_t e = cudaMemcpy(host_world_spheres_count, world_spheres_count.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        delete[] host_world_spheres_count;
+        delete[] host_world_capsules_count;
+        delete[] host_world_boxes_count;
+        delete[] host_world_halfspaces_count;
+        delete[] host_self_pairs_count;
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+    e = cudaMemcpy(host_world_capsules_count, world_capsules_count.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        delete[] host_world_spheres_count;
+        delete[] host_world_capsules_count;
+        delete[] host_world_boxes_count;
+        delete[] host_world_halfspaces_count;
+        delete[] host_self_pairs_count;
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+    e = cudaMemcpy(host_world_boxes_count, world_boxes_count.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        delete[] host_world_spheres_count;
+        delete[] host_world_capsules_count;
+        delete[] host_world_boxes_count;
+        delete[] host_world_halfspaces_count;
+        delete[] host_self_pairs_count;
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+    e = cudaMemcpy(host_world_halfspaces_count, world_halfspaces_count.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        delete[] host_world_spheres_count;
+        delete[] host_world_capsules_count;
+        delete[] host_world_boxes_count;
+        delete[] host_world_halfspaces_count;
+        delete[] host_self_pairs_count;
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+    e = cudaMemcpy(host_self_pairs_count, self_pairs_count.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        delete[] host_world_spheres_count;
+        delete[] host_world_capsules_count;
+        delete[] host_world_boxes_count;
+        delete[] host_world_halfspaces_count;
+        delete[] host_self_pairs_count;
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    float* all_ta_radii = nullptr;
+    float* all_tb_radii = nullptr;
+    e = cudaMalloc(&all_ta_radii, sizeof(float) * max_nodes * batch);
+    if (e != cudaSuccess) {
+        delete[] host_world_spheres_count;
+        delete[] host_world_capsules_count;
+        delete[] host_world_boxes_count;
+        delete[] host_world_halfspaces_count;
+        delete[] host_self_pairs_count;
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+    e = cudaMalloc(&all_tb_radii, sizeof(float) * max_nodes * batch);
+    if (e != cudaSuccess) {
+        delete[] host_world_spheres_count;
+        delete[] host_world_capsules_count;
+        delete[] host_world_boxes_count;
+        delete[] host_world_halfspaces_count;
+        delete[] host_self_pairs_count;
+        cudaFree(all_ta_radii);
+        return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    }
+
+    cudaStream_t* child_streams = new cudaStream_t[batch];
+    for (int b = 0; b < batch; ++b)
+        cudaStreamCreateWithFlags(&child_streams[b], cudaStreamNonBlocking);
+    cudaEvent_t* kernel_start_events = new cudaEvent_t[batch];
+    cudaEvent_t* kernel_end_events = new cudaEvent_t[batch];
+    for (int b = 0; b < batch; ++b) {
+        cudaEventCreate(&kernel_start_events[b]);
+        cudaEventCreate(&kernel_end_events[b]);
+    }
+
+    const int threads_fill = 16;
+    const int blocks_fill = (max_nodes + threads_fill - 1) / threads_fill;
+
+    const int init_sizes[2] = {1, num_goals};
+    const int init_conn[3] = {-1, -1, -1};
+    const int zero = 0;
+
+    for (int b = 0; b < batch; ++b) {
+        cudaStream_t s = child_streams[b];
+
+        float* start_b = start_configs.typed_data() + b * dim;
+        float* ta_cfg_b = tree_a_configs->typed_data() + (size_t)b * dim * max_nodes;
+        float* tb_cfg_b = tree_b_configs->typed_data() + (size_t)b * dim * max_nodes;
+        int* ta_par_b = tree_a_parents->typed_data() + b * max_nodes;
+        int* tb_par_b = tree_b_parents->typed_data() + b * max_nodes;
+        int* tsizes_b = tree_sizes->typed_data() + b * 2;
+        int* comp_b = completed->typed_data() + b * 2;
+        int* iter_b = iter_count->typed_data() + b * 1;
+        int* conn_b = connection_info->typed_data() + b * 3;
+        int* solved_b = solved_flag->typed_data() + b * 1;
+        float* ta_rad_b = all_ta_radii + b * max_nodes;
+        float* tb_rad_b = all_tb_radii + b * max_nodes;
+
+        cudaMemsetAsync(ta_cfg_b, 0, sizeof(float) * dim * max_nodes, s);
+        cudaMemsetAsync(tb_cfg_b, 0, sizeof(float) * dim * max_nodes, s);
+        cudaMemsetAsync(ta_par_b, -1, sizeof(int) * max_nodes, s);
+        cudaMemsetAsync(tb_par_b, -1, sizeof(int) * max_nodes, s);
+
+        cudaMemcpyAsync(tsizes_b, init_sizes, sizeof(int) * 2, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(comp_b, init_sizes, sizeof(int) * 2, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(iter_b, &zero, sizeof(int), cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(conn_b, init_conn, sizeof(int) * 3, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(solved_b, &zero, sizeof(int), cudaMemcpyHostToDevice, s);
+
+        prrtc_fill_float_kernel<<<blocks_fill, threads_fill, 0, s>>>(ta_rad_b, FLT_MAX, max_nodes);
+        prrtc_fill_float_kernel<<<blocks_fill, threads_fill, 0, s>>>(tb_rad_b, FLT_MAX, max_nodes);
+
+        const float* goals_b = goal_configs.typed_data() + b * num_goals * dim;
+        prrtc_init_kernel<<<1, 32, 0, s>>>(
+            start_b, goals_b,
+            ta_cfg_b, tb_cfg_b, ta_par_b, tb_par_b,
+            num_goals, dim, max_nodes
+        );
+
+        CollisionContext collision_ctx;
+        collision_ctx.twists = fk_twists.typed_data();
+        collision_ctx.parent_tf = fk_parent_tf.typed_data();
+        collision_ctx.parent_idx = fk_parent_idx.typed_data();
+        collision_ctx.act_idx = fk_act_idx.typed_data();
+        collision_ctx.mimic_mul = fk_mimic_mul.typed_data();
+        collision_ctx.mimic_off = fk_mimic_off.typed_data();
+        collision_ctx.mimic_act_idx = fk_mimic_act_idx.typed_data();
+        collision_ctx.topo_inv = fk_topo_inv.typed_data();
+        collision_ctx.sphere_link_idx = sphere_link_idx.typed_data();
+        collision_ctx.sphere_local = sphere_local.typed_data();
+        collision_ctx.sphere_radius = sphere_radius.typed_data();
+        collision_ctx.world_spheres = world_spheres_batched.typed_data() + (size_t)b * max_world_spheres * 4;
+        collision_ctx.world_capsules = world_capsules_batched.typed_data() + (size_t)b * max_world_capsules * 7;
+        collision_ctx.world_boxes = world_boxes_batched.typed_data() + (size_t)b * max_world_boxes * 15;
+        collision_ctx.world_halfspaces = world_halfspaces_batched.typed_data() + (size_t)b * max_world_halfspaces * 6;
+        collision_ctx.self_pairs = self_pairs_batched.typed_data() + (size_t)b * max_self_pairs * 2;
+
+        collision_ctx.n_joints = n_joints;
+        collision_ctx.n_act = dim;
+        collision_ctx.n_robot_spheres = n_robot_spheres;
+        collision_ctx.n_world_spheres = host_world_spheres_count[b];
+        collision_ctx.n_world_capsules = host_world_capsules_count[b];
+        collision_ctx.n_world_boxes = host_world_boxes_count[b];
+        collision_ctx.n_world_halfspaces = host_world_halfspaces_count[b];
+        collision_ctx.n_self_pairs = host_self_pairs_count[b];
+        collision_ctx.enabled = (n_joints > 0 && n_robot_spheres > 0 &&
+            (collision_ctx.n_world_spheres > 0 || collision_ctx.n_world_capsules > 0 ||
+             collision_ctx.n_world_boxes > 0 || collision_ctx.n_world_halfspaces > 0 ||
+             collision_ctx.n_self_pairs > 0)) ? 1 : 0;
+
+        cudaEventRecord(kernel_start_events[b], s);
+        prrtc_planner_kernel<<<num_new_samples, granularity, 0, s>>>(
+            ta_cfg_b, tb_cfg_b, ta_par_b, tb_par_b,
+            ta_rad_b, tb_rad_b,
+            min_vals.typed_data(), max_vals.typed_data(),
+            tsizes_b, comp_b, iter_b, conn_b, solved_b,
+            collision_ctx,
+            max_iterations, step_size, num_new_samples,
+            balance_mode, tree_ratio, dynamic_domain,
+            dd_alpha, dd_radius, dd_min_radius,
+            dim, max_nodes, granularity
+        );
+        cudaEventRecord(kernel_end_events[b], s);
+    }
+
+    float* host_kernel_times = new float[batch];
+    for (int b = 0; b < batch; ++b) {
+        cudaEventSynchronize(kernel_end_events[b]);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, kernel_start_events[b], kernel_end_events[b]);
+        host_kernel_times[b] = elapsed_ms;
+    }
+    cudaMemcpyAsync(
+        kernel_time_ms->typed_data(),
+        host_kernel_times,
+        sizeof(float) * batch,
+        cudaMemcpyHostToDevice,
+        stream
+    );
+    delete[] host_kernel_times;
+
+    cudaEvent_t* events = new cudaEvent_t[batch];
+    for (int b = 0; b < batch; ++b) {
+        cudaEventCreateWithFlags(&events[b], cudaEventDisableTiming);
+        cudaEventRecord(events[b], child_streams[b]);
+        cudaStreamWaitEvent(stream, events[b], 0);
+    }
+
+    for (int b = 0; b < batch; ++b) {
+        cudaEventDestroy(events[b]);
+        cudaEventDestroy(kernel_start_events[b]);
+        cudaEventDestroy(kernel_end_events[b]);
+        cudaStreamDestroy(child_streams[b]);
+    }
+    delete[] events;
+    delete[] kernel_start_events;
+    delete[] kernel_end_events;
+    delete[] child_streams;
+    delete[] host_world_spheres_count;
+    delete[] host_world_capsules_count;
+    delete[] host_world_boxes_count;
+    delete[] host_world_halfspaces_count;
+    delete[] host_self_pairs_count;
+    cudaFree(all_ta_radii);
+    cudaFree(all_tb_radii);
+
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    PrrtcPlannerBatchCtxFfi, PrrtcPlannerBatchCtxImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // start_configs [batch, dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // goal_configs [batch, num_goals, dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // min_vals [dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // max_vals [dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_twists
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_parent_tf
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_parent_idx
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_act_idx
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_mimic_mul
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // fk_mimic_off
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_mimic_act_idx
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fk_topo_inv
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // sphere_link_idx
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // sphere_local
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // sphere_radius
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_spheres_batched [batch, max_ws, 4]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_capsules_batched [batch, max_wc, 7]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_boxes_batched [batch, max_wb, 15]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_halfspaces_batched [batch, max_wh, 6]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pairs_batched [batch, max_sp, 2]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // world_spheres_count [batch]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // world_capsules_count [batch]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // world_boxes_count [batch]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // world_halfspaces_count [batch]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pairs_count [batch]
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_a_configs [batch, dim, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_b_configs [batch, dim, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_a_parents [batch, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_b_parents [batch, max_nodes]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_sizes [batch, 2]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // completed [batch, 2]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // iter_count [batch, 1]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // connection_info [batch, 3]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // solved_flag [batch, 1]
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()  // kernel_time_ms [batch]
+        .Attr<int>("max_iterations")
+        .Attr<float>("step_size")
+        .Attr<int>("num_new_samples")
+        .Attr<int>("balance_mode")
+        .Attr<float>("tree_ratio")
+        .Attr<int>("dynamic_domain")
+        .Attr<float>("dd_alpha")
+        .Attr<float>("dd_radius")
+        .Attr<float>("dd_min_radius")
+        .Attr<int>("dim")
+        .Attr<int>("max_nodes")
+        .Attr<int>("granularity")
+);
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     PrrtcPlannerBatchFfi, PrrtcPlannerBatchImpl,
     ffi::Ffi::Bind()

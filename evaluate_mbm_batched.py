@@ -19,7 +19,6 @@ import numpy as np
 import pandas as pd
 import pyronot as pk
 import yourdfpy
-from tqdm import tqdm
 
 try:
     from loguru import logger
@@ -71,7 +70,7 @@ ROOT = Path(__file__).resolve().parent
 RESOURCES = ROOT / "pyronot" / "resources"
 PRRTC_ROOT = ROOT / "cuda-rrtc" / "jax"
 PRRTC_SCRIPTS = ROOT / "pRRTC" / "scripts"
-TQDM_DISABLE = not sys.stdout.isatty()
+SOLVE_BATCH_CHUNK_SIZE = 25
 
 
 def _load_module(module_name: str, module_path: Path):
@@ -167,10 +166,9 @@ def _environment_signature(problem_data: dict[str, Any]) -> str:
 
 def _batched_solve_group(
     group_data: list[dict[str, Any]],
-    robot_model,
-    robot_coll,
     lo,
     hi,
+    collision_context,
     *,
     max_iterations: int,
     step_size: float,
@@ -185,17 +183,10 @@ def _batched_solve_group(
     dd_min_radius: float,
     warmup: bool,
     timing_source: str,
+    jit_trace: bool,
 ):
     starts = np.asarray([p["start"] for p in group_data], dtype=np.float32)
     goals = np.asarray([p["goals"] for p in group_data], dtype=np.float32)
-
-    # Group shares one obstacle scene by construction (same environment signature).
-    obstacles = create_collision_environment(group_data[0])
-    collision_context = PRRTC_UTILS.build_prrtc_collision_context(
-        robot_model,
-        robot_coll,
-        obstacles,
-    )
 
     batch_kwargs = dict(
         start_configs=jnp.asarray(starts, dtype=jnp.float32),
@@ -214,6 +205,7 @@ def _batched_solve_group(
         min_vals=lo,
         max_vals=hi,
         collision_context=collision_context,
+        jit_trace=jit_trace,
     )
 
     if warmup:
@@ -257,6 +249,7 @@ def evaluate_robot(
     dd_min_radius: float,
     warmup: bool,
     timing_source: str,
+    jit_trace: bool,
     max_problems_per_set: int,
     print_failures: bool,
 ):
@@ -299,28 +292,44 @@ def evaluate_robot(
                 print(f"  Invalid problems: {invalids}")
             continue
 
-        groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-        for local_idx, pdata in enumerate(valid_data):
+        # Build one collision context per problem, reusing identical scenes.
+        context_cache: dict[str, Any] = {}
+        per_problem_contexts: list[dict[str, Any]] = []
+        for pdata in valid_data:
             sig = _environment_signature(pdata)
-            groups.setdefault(sig, []).append((local_idx, pdata))
+            if sig not in context_cache:
+                obstacles = create_collision_environment(pdata)
+                context_cache[sig] = PRRTC_UTILS.build_prrtc_collision_context(
+                    robot_model,
+                    robot_coll,
+                    obstacles,
+                )
+            per_problem_contexts.append(context_cache[sig])
 
-        if len(groups) > 1:
+        if len(context_cache) > 1:
             print(
-                f"  Note: detected {len(groups)} scene variants in {problem_name}; "
-                "running one batch per scene variant."
+                f"  Note: detected {len(context_cache)} scene variants in {problem_name}; "
+                "dispatching one batched solve with per-problem collision contexts."
             )
 
-        ordered_group_items = list(groups.values())
-        for group in tqdm(ordered_group_items, disable=TQDM_DISABLE):
-            group_local_indices = [x[0] for x in group]
-            group_data = [x[1] for x in group]
+        if len(valid_data) > SOLVE_BATCH_CHUNK_SIZE:
+            n_chunks = (len(valid_data) + SOLVE_BATCH_CHUNK_SIZE - 1) // SOLVE_BATCH_CHUNK_SIZE
+            print(
+                f"  Splitting {len(valid_data)} valid problems into {n_chunks} chunks "
+                f"of up to {SOLVE_BATCH_CHUNK_SIZE}."
+            )
+
+        for chunk_start in range(0, len(valid_data), SOLVE_BATCH_CHUNK_SIZE):
+            chunk_end = min(chunk_start + SOLVE_BATCH_CHUNK_SIZE, len(valid_data))
+            chunk_valid_data = valid_data[chunk_start:chunk_end]
+            chunk_contexts = per_problem_contexts[chunk_start:chunk_end]
+            chunk_global_indices = valid_global_indices[chunk_start:chunk_end]
 
             batch_results, per_problem_ns_list = _batched_solve_group(
-                group_data,
-                robot_model,
-                robot_coll,
+                chunk_valid_data,
                 lo,
                 hi,
+                chunk_contexts,
                 max_iterations=max_iterations,
                 step_size=step_size,
                 num_new_samples=num_new_samples,
@@ -332,12 +341,13 @@ def evaluate_robot(
                 dd_alpha=dd_alpha,
                 dd_radius=dd_radius,
                 dd_min_radius=dd_min_radius,
-                warmup=warmup,
+                warmup=bool(warmup and chunk_start == 0),
                 timing_source=timing_source,
+                jit_trace=jit_trace,
             )
 
             for pos, result in enumerate(batch_results):
-                global_idx = valid_global_indices[group_local_indices[pos]]
+                global_idx = chunk_global_indices[pos]
                 if not result.solved:
                     failures.append(global_idx)
                     continue
@@ -399,6 +409,18 @@ def parse_args() -> argparse.Namespace:
         default="host",
         help="Use host wall time (default) or kernel-reported time for planning_time.",
     )
+    parser.add_argument(
+        "--jit-trace",
+        action="store_true",
+        default=True,
+        help="Use cached jax.jit tracing for batched pRRTC FFI dispatch.",
+    )
+    parser.add_argument(
+        "--no-jit-trace",
+        action="store_false",
+        dest="jit_trace",
+        help="Disable jax.jit tracing and call the FFI dispatch path directly.",
+    )
     parser.add_argument("--max-problems-per-set", type=int, default=0)
     parser.add_argument("--print-failures", action="store_true")
     return parser.parse_args()
@@ -435,6 +457,7 @@ def main() -> None:
             dd_min_radius=args.dd_min_radius,
             warmup=args.warmup,
             timing_source=args.timing_source,
+            jit_trace=args.jit_trace,
             max_problems_per_set=args.max_problems_per_set,
             print_failures=args.print_failures,
         )
@@ -500,6 +523,7 @@ def main() -> None:
     tock = time.perf_counter()
 
     print(f"Timing source for planning_time: {args.timing_source}")
+    print(f"JIT tracing for batched pRRTC dispatch: {args.jit_trace}")
     print(f"Solved / Valid / Total # Problems: {valid - failed} / {valid} / {total}")
     print(f"Completed all problems in {df['total_time'].sum() / 1000:.3f} milliseconds")
     print(f"Total time including Python overhead: {(tock - tick) * 1000:.3f} milliseconds")
@@ -507,6 +531,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-### TODO: Fix collision context so it doesn't collapse to serial calls every time the environment changes, and re-enable batching for MBM problems. This will likely require some changes to the PRRTC API to allow pre-building and reusing collision contexts across batches.
