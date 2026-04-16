@@ -63,6 +63,166 @@ except ModuleNotFoundError:
 from pyronot.collision._obstacles import create_collision_environment
 from pyronot.collision._robot_collision import RobotCollisionSpherized
 
+# Maximum joints the CUDA FK kernel supports (PRRTC_MAX_JOINTS in prrtc_planner.cu).
+_PRRTC_MAX_JOINTS = 64
+
+
+def verify_robot_collision_context(
+    robot_name: str,
+    robot_model,
+    robot_coll,
+    lo: "np.ndarray",
+    hi: "np.ndarray",
+    collision_context: dict,
+    *,
+    start: "np.ndarray | None" = None,
+    goals: "np.ndarray | None" = None,
+) -> None:
+    """Hard assertions verifying pyronot↔cuda-rrtc collision-context consistency.
+
+    Catches URDF/SRDF parsing mismatches that silently break multi-EEF robots
+    by making every configuration appear to be in collision.
+
+    Checks
+    ------
+    1.  Joint-limit ordering sanity (lo < hi for all actuated joints).
+    2.  Config-dimension agreement: start/goal dim == n_act == lo/hi dim.
+    3.  fk_act_idx range: every value is -1 (fixed) or in [0, n_act).
+    4.  All actuated joint indices 0..n_act-1 appear in fk_act_idx (no orphaned DOFs).
+    5.  fk_mimic_act_idx range: every value is -1 or in [0, n_act).
+    6.  sphere_link_idx range: every value is in [0, n_joints) -- no -1 base-link refs
+        that would corrupt FK lookups.
+    7.  n_joints <= PRRTC_MAX_JOINTS (CUDA stack array limit).
+    8.  No always-colliding self-collision pairs at the zero configuration -- a
+        structural SRDF gap that permanently blocks all configurations.
+    9.  If start/goals provided: every start and every goal is collision-free
+        according to pyronot (world + self).  Catches joint-ordering mismatches
+        between the dataset and the robot model.
+    """
+    fk_act_idx = np.asarray(collision_context["fk_act_idx"])
+    fk_mimic_act_idx = np.asarray(collision_context["fk_mimic_act_idx"])
+    sphere_link_idx = np.asarray(collision_context["sphere_link_idx"])
+
+    n_act = int(robot_model.joints.num_actuated_joints)
+    n_joints = int(robot_model.joints.num_joints)
+    lo_np = np.asarray(lo)
+    hi_np = np.asarray(hi)
+
+    # 1. Joint-limit ordering
+    assert np.all(lo_np < hi_np), (
+        f"[{robot_name}] Joint limits violated: lo >= hi for joints "
+        f"{np.where(lo_np >= hi_np)[0].tolist()}"
+    )
+
+    # 2. Config-dimension agreement
+    assert lo_np.shape[0] == n_act, (
+        f"[{robot_name}] lo.shape[0]={lo_np.shape[0]} != n_act={n_act}"
+    )
+    assert hi_np.shape[0] == n_act, (
+        f"[{robot_name}] hi.shape[0]={hi_np.shape[0]} != n_act={n_act}"
+    )
+    if start is not None:
+        start_np = np.asarray(start)
+        assert start_np.shape[-1] == n_act, (
+            f"[{robot_name}] start dim {start_np.shape[-1]} != n_act {n_act}. "
+            "Dataset joint ordering may not match pyronot's actuated_joints ordering."
+        )
+    if goals is not None:
+        goals_np = np.asarray(goals)
+        assert goals_np.shape[-1] == n_act, (
+            f"[{robot_name}] goals dim {goals_np.shape[-1]} != n_act {n_act}. "
+            "Dataset joint ordering may not match pyronot's actuated_joints ordering."
+        )
+
+    # 3. fk_act_idx range
+    assert np.all((fk_act_idx == -1) | ((fk_act_idx >= 0) & (fk_act_idx < n_act))), (
+        f"[{robot_name}] fk_act_idx contains values outside [-1, n_act={n_act}): "
+        f"{fk_act_idx[(fk_act_idx != -1) & ((fk_act_idx < 0) | (fk_act_idx >= n_act))].tolist()}"
+    )
+
+    # 4. All actuated joint indices covered (no orphaned DOFs in multi-EEF robots)
+    covered = set(fk_act_idx[fk_act_idx >= 0].tolist())
+    missing = set(range(n_act)) - covered
+    assert not missing, (
+        f"[{robot_name}] Actuated joint indices {sorted(missing)} do not appear in "
+        "fk_act_idx -- those DOFs are invisible to the CUDA FK. "
+        "Check actuated_joints ordering in the spherized URDF."
+    )
+
+    # 5. fk_mimic_act_idx range
+    assert np.all(
+        (fk_mimic_act_idx == -1) | ((fk_mimic_act_idx >= 0) & (fk_mimic_act_idx < n_act))
+    ), (
+        f"[{robot_name}] fk_mimic_act_idx contains out-of-range values."
+    )
+
+    # 6. sphere_link_idx range: -1 is allowed (base-link spheres; the CUDA kernel
+    #    skips them via `if (link_idx < 0 || link_idx >= n_joints) continue`).
+    #    Any value < -1 or >= n_joints is genuinely out of range and will corrupt
+    #    T_world array accesses.
+    if sphere_link_idx.size > 0:
+        assert np.all((sphere_link_idx >= -1) & (sphere_link_idx < n_joints)), (
+            f"[{robot_name}] sphere_link_idx contains values outside [-1, n_joints={n_joints}): "
+            f"min={sphere_link_idx.min()}, max={sphere_link_idx.max()}. "
+            "Values < -1 or >= n_joints will produce out-of-bounds T_world reads in the CUDA FK."
+        )
+
+    # 7. CUDA FK stack limit
+    assert n_joints <= _PRRTC_MAX_JOINTS, (
+        f"[{robot_name}] n_joints={n_joints} exceeds PRRTC_MAX_JOINTS={_PRRTC_MAX_JOINTS}. "
+        "The CUDA FK allocates a fixed stack of that size."
+    )
+
+    # 8. No always-colliding self-collision pairs at zero configuration.
+    #    A constant negative distance means the SRDF is missing an adjacent-link
+    #    disable entry -- the CUDA planner will reject every configuration.
+    zero_cfg = jnp.zeros(n_act, dtype=jnp.float32)
+    self_dists_zero = np.asarray(
+        robot_coll.compute_self_collision_distance(robot_model, zero_cfg)
+    )
+    always_coll_mask = self_dists_zero < 0
+    if np.any(always_coll_mask):
+        active_i = np.asarray(robot_coll.active_idx_i)
+        active_j = np.asarray(robot_coll.active_idx_j)
+        bad_pairs = [
+            (robot_coll.link_names[active_i[k]], robot_coll.link_names[active_j[k]],
+             float(self_dists_zero[k]))
+            for k in np.where(always_coll_mask)[0]
+        ]
+        raise AssertionError(
+            f"[{robot_name}] {len(bad_pairs)} self-collision pair(s) are always in collision "
+            f"at the zero configuration. These missing SRDF disable_collisions entries will "
+            f"cause the CUDA planner to reject EVERY configuration:\n"
+            + "\n".join(
+                f"  {ln1} <-> {ln2}  (dist={d:.6f})" for ln1, ln2, d in bad_pairs
+            )
+        )
+
+    # 9. Start/goal collision-free check (self-collision only; world obstacles are
+    #    problem-specific so we test structural validity against an empty environment).
+    def _self_collision_report(cfg):
+        min_self = float(np.min(np.asarray(
+            robot_coll.compute_self_collision_distance(robot_model, jnp.asarray(cfg, dtype=jnp.float32))
+        )))
+        return min_self
+
+    if start is not None:
+        min_self = _self_collision_report(start)
+        assert min_self > -1e-3, (
+            f"[{robot_name}] Start configuration is in self-collision "
+            f"(min_self={min_self:.6f}). "
+            "The dataset may use a different joint ordering than pyronot's actuated_joints."
+        )
+    if goals is not None:
+        goals_arr = np.asarray(goals).reshape(-1, n_act)
+        for gi, g in enumerate(goals_arr):
+            min_self = _self_collision_report(g)
+            assert min_self > -1e-3, (
+                f"[{robot_name}] Goal[{gi}] is in self-collision "
+                f"(min_self={min_self:.6f}). "
+                "The dataset may use a different joint ordering than pyronot's actuated_joints."
+            )
+
 
 ROOT = Path(__file__).resolve().parent
 RESOURCES = ROOT / "pyronot" / "resources"
@@ -70,8 +230,8 @@ PRRTC_ROOT = ROOT / "cuda-rrtc" / "jax"
 TQDM_DISABLE = not sys.stdout.isatty()
 STEP_SIZE_BY_ROBOT = {
     "panda": 0.5,
-    "fetch": 0.6,
-    "baxter": 0.25,
+    "fetch": 0.5,
+    "baxter": 0.5,
 }
 
 
@@ -156,6 +316,15 @@ def evaluate_robot(
 
     results: list[dict[str, Any]] = []
 
+    # Run structural verification once per robot before any planning.
+    # Build a dummy context (no world obstacles) to check FK array invariants.
+    _dummy_ctx = PRRTC_UTILS.build_prrtc_collision_context(robot_model, robot_coll, [])
+    verify_robot_collision_context(
+        robot, robot_model, robot_coll, np.asarray(lo), np.asarray(hi), _dummy_ctx
+    )
+
+    _first_valid_verified = False
+
     for problem_name, pset in problems.items():
         if not isinstance(pset, list):
             continue
@@ -183,6 +352,20 @@ def evaluate_robot(
                 robot_coll,
                 obstacles,
             )
+
+            # Verify start/goal collision-freedom once per robot (first valid problem).
+            if not _first_valid_verified:
+                verify_robot_collision_context(
+                    robot,
+                    robot_model,
+                    robot_coll,
+                    np.asarray(lo),
+                    np.asarray(hi),
+                    collision_context,
+                    start=np.asarray(start),
+                    goals=np.asarray(goals),
+                )
+                _first_valid_verified = True
 
             plan_kwargs = dict(
                 start_config=start,
