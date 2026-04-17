@@ -1,6 +1,6 @@
-# cuda-rrtc: GPU-Accelerated Parallel RRTC Motion Planner
+# RRAX: A reimplementation of pRRTC through the Jax FFI
 
-`cuda-rrtc` is a CUDA-accelerated implementation of the Parallel Rapidly-exploring Random Tree (pRRTC) motion planning algorithm, designed for integration with PyRoFFI's robotics kinematics and collision checking framework.
+`RRAX` is a CUDA-accelerated implementation of the Parallel Rapidly-exploring Random Tree (pRRTC) motion planning algorithm, designed for integration with PyRoNot's robotics kinematics and collision checking framework. See the original pRRTC paper here: [pRRTC paper](https://arxiv.org/abs/2503.06757), and the original code at [pRRTC code](https://github.com/CoMMALab/pRRTC.git).
 
 ## Key Features
 
@@ -19,7 +19,7 @@
 Install PyRoFFI
 ```
 git clone https://github.com/commalab/pyroffi
-cd pyroffi
+cd pyronot
 pip install -e .
 pip install -r requirements.txt
 ```
@@ -136,91 +136,4 @@ result = prrtc_plan(
     max_iterations=10000,
     step_size=0.5,
 )
-```
-
-## API Reference
-
-### `prrtc_plan`
-
-```python
-def prrtc_plan(
-    start_config: Float[Array, "*batch dim"],
-    goal_configs: Float[Array, "num_goals dim"],
-    max_iterations: int = 1_000_000,
-    step_size: float = 0.5,
-    num_new_samples: int = 128,
-    granularity: int = 16,
-    max_nodes: int = 1_000_000,
-    balance_mode: int = 1,
-    tree_ratio: float = 0.5,
-    dynamic_domain: bool = True,
-    dd_alpha: float = 1e-4,
-    dd_radius: float = 4.0,
-    dd_min_radius: float = 1.0,
-    min_vals: Optional[Float[Array, "dim"]] = None,
-    max_vals: Optional[Float[Array, "dim"]] = None,
-    collision_context: Optional[dict[str, Array]] = None,
-    allow_unsafe_no_collision: bool = False,
-) -> PRRTCResult:
-```
-
-### `PRRTCResult` NamedTuple
-
-```python
-class PRRTCResult(NamedTuple):
-    solved: bool
-    path: Optional[Array]
-    tree_a_size: int
-    tree_b_size: int
-    iterations: int
-    cost: float
-    kernel_time_ms: Optional[float] = None
-    tree_a_configs: Optional[Array] = None
-    tree_b_configs: Optional[Array] = None
-    tree_a_parents: Optional[Array] = None
-    tree_b_parents: Optional[Array] = None
-
-```
-
-Notes:
-
-- `start_config` is currently one start per call. For many independent problems,
-  use `jax.vmap` as shown above.
-- Goal sets are multi-goal per call: shape `(num_goals, dim)`.
-- Collision-aware planning is the default unless explicitly disabled.
-
-### `prrtc_plan_batch` (module-level)
-
-This helper exists in `cuda_rrtc.jax.prrtc` and runs a full batch in one FFI call.
-It is not re-exported by `cuda_rrtc.jax.__init__`.
-
-```python
-from cuda_rrtc.jax.prrtc import prrtc_plan_batch
-
-results = prrtc_plan_batch(
-    start_configs,            # (batch, dim)
-    goal_configs[:, None, :], # (batch, 1, dim) for one goal each
-    collision_context=cc,
-)
-```
-
-### `prrtc_nearest_neighbor`
-
-```python
-def prrtc_nearest_neighbor(
-    tree_configs: Float[Array, "dim max_nodes"],
-    query_configs: Float[Array, "batch dim"],
-    tree_size: int,
-) -> tuple[Float[Array, "batch"], Int[Array, "batch"]]:
-```
-
-### `prrtc_extend`
-
-```python
-def prrtc_extend(
-    tree_configs: Float[Array, "dim max_nodes"],
-    nearest_indices: Int[Array, "batch"],
-    samples: Float[Array, "batch dim"],
-    step_size: float,
-) -> tuple[Float[Array, "batch dim"], Int[Array, "batch"], Int[Array, "batch"]]:
 ```
