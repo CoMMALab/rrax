@@ -18,7 +18,7 @@
 
 Install PyRoFFI
 ```
-git clone https://github.com/commalab/pyronot
+git clone https://github.com/commalab/pyroffi
 cd pyronot
 pip install -e .
 pip install -r requirements.txt
