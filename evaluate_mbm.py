@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark CUDA pRRTC on MBM problems from pyronot resources."""
+"""Benchmark CUDA pRRTC on MBM problems from pyroffi resources."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-import pyronot as pk
+import pyroffi as pk
 import yourdfpy
 from tqdm import tqdm
 
@@ -60,8 +60,8 @@ except ModuleNotFoundError:
             return data.to_string()
         return str(data)
 
-from pyronot.collision._obstacles import create_collision_environment
-from pyronot.collision._robot_collision import RobotCollisionSpherized
+from pyroffi.collision._obstacles import create_collision_environment
+from pyroffi.collision._robot_collision import RobotCollisionSpherized
 
 # Maximum joints the CUDA FK kernel supports (PRRTC_MAX_JOINTS in prrtc_planner.cu).
 _PRRTC_MAX_JOINTS = 64
@@ -78,7 +78,7 @@ def verify_robot_collision_context(
     start: "np.ndarray | None" = None,
     goals: "np.ndarray | None" = None,
 ) -> None:
-    """Hard assertions verifying pyronot↔cuda-rrtc collision-context consistency.
+    """Hard assertions verifying pyroffi↔cuda-rrtc collision-context consistency.
 
     Catches URDF/SRDF parsing mismatches that silently break multi-EEF robots
     by making every configuration appear to be in collision.
@@ -96,7 +96,7 @@ def verify_robot_collision_context(
     8.  No always-colliding self-collision pairs at the zero configuration -- a
         structural SRDF gap that permanently blocks all configurations.
     9.  If start/goals provided: every start and every goal is collision-free
-        according to pyronot (world + self).  Catches joint-ordering mismatches
+        according to pyroffi (world + self).  Catches joint-ordering mismatches
         between the dataset and the robot model.
     """
     fk_act_idx = np.asarray(collision_context["fk_act_idx"])
@@ -125,13 +125,13 @@ def verify_robot_collision_context(
         start_np = np.asarray(start)
         assert start_np.shape[-1] == n_act, (
             f"[{robot_name}] start dim {start_np.shape[-1]} != n_act {n_act}. "
-            "Dataset joint ordering may not match pyronot's actuated_joints ordering."
+            "Dataset joint ordering may not match pyroffi's actuated_joints ordering."
         )
     if goals is not None:
         goals_np = np.asarray(goals)
         assert goals_np.shape[-1] == n_act, (
             f"[{robot_name}] goals dim {goals_np.shape[-1]} != n_act {n_act}. "
-            "Dataset joint ordering may not match pyronot's actuated_joints ordering."
+            "Dataset joint ordering may not match pyroffi's actuated_joints ordering."
         )
 
     # 3. fk_act_idx range
@@ -211,7 +211,7 @@ def verify_robot_collision_context(
         assert min_self > -1e-3, (
             f"[{robot_name}] Start configuration is in self-collision "
             f"(min_self={min_self:.6f}). "
-            "The dataset may use a different joint ordering than pyronot's actuated_joints."
+            "The dataset may use a different joint ordering than pyroffi's actuated_joints."
         )
     if goals is not None:
         goals_arr = np.asarray(goals).reshape(-1, n_act)
@@ -220,12 +220,12 @@ def verify_robot_collision_context(
             assert min_self > -1e-3, (
                 f"[{robot_name}] Goal[{gi}] is in self-collision "
                 f"(min_self={min_self:.6f}). "
-                "The dataset may use a different joint ordering than pyronot's actuated_joints."
+                "The dataset may use a different joint ordering than pyroffi's actuated_joints."
             )
 
 
 ROOT = Path(__file__).resolve().parent
-RESOURCES = ROOT / "pyronot" / "resources"
+RESOURCES = ROOT / "pyroffi" / "resources"
 PRRTC_ROOT = ROOT / "cuda-rrtc" / "jax"
 TQDM_DISABLE = not sys.stdout.isatty()
 STEP_SIZE_BY_ROBOT = {
@@ -249,7 +249,7 @@ PRRTC_UTILS = _load_module("cuda_rrtc_utils", PRRTC_ROOT / "utils.py")
 
 
 def load_robot_dataset(robot: str) -> dict[str, Any]:
-    """Load MBM dataset from pyronot/resources."""
+    """Load MBM dataset from pyroffi/resources."""
     robot_dir = RESOURCES / robot
     pkl_path = robot_dir / "problems.pkl"
 

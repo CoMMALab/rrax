@@ -10,7 +10,7 @@ from typing import Any
 import jax.numpy as jnp
 import numpy as np
 
-from pyronot.collision._geometry import Box, Capsule, HalfSpace, Sphere
+from pyroffi.collision._geometry import Box, Capsule, HalfSpace, Sphere
 
 
 def load_vamp_problem(

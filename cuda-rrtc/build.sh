@@ -31,11 +31,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Output library
 OUT="${SCRIPT_DIR}/_prrtc_planner_lib.so"
 
-# pyronot CUDA kernel headers (collision + FK)
-PYRONOT_CUDA_INC="${SCRIPT_DIR}/../pyronot/src/pyronot/cuda_kernels"
-if [ ! -f "${PYRONOT_CUDA_INC}/_fk_cuda_helpers.cuh" ]; then
-  echo "ERROR: pyronot cuda_kernels not found at ${PYRONOT_CUDA_INC}"
-  echo "Make sure pyronot is checked out alongside cuda-rrtc."
+# pyroffi CUDA kernel headers (collision + FK)
+PYROFFI_CUDA_INC="${SCRIPT_DIR}/../pyroffi/src/pyroffi/cuda_kernels"
+if [ ! -f "${PYROFFI_CUDA_INC}/_fk_cuda_helpers.cuh" ]; then
+  echo "ERROR: pyroffi cuda_kernels not found at ${PYROFFI_CUDA_INC}"
+  echo "Make sure pyroffi is checked out alongside cuda-rrtc."
   exit 1
 fi
 
@@ -82,7 +82,7 @@ nvcc \
   --shared \
   --compiler-options "-fPIC" \
   -I"${JAXLIB_INC}" \
-  -I"${PYRONOT_CUDA_INC}" \
+  -I"${PYROFFI_CUDA_INC}" \
   -o "${OUT}" \
   "${SOURCES[@]}"
 

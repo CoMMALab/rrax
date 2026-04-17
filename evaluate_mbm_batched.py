@@ -15,7 +15,7 @@ from typing import Any
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-import pyronot as pk
+import pyroffi as pk
 import yourdfpy
 
 try:
@@ -60,12 +60,12 @@ except ModuleNotFoundError:
             return data.to_string()
         return str(data)
 
-from pyronot.collision._obstacles import create_collision_environment
-from pyronot.collision._robot_collision import RobotCollisionSpherized
+from pyroffi.collision._obstacles import create_collision_environment
+from pyroffi.collision._robot_collision import RobotCollisionSpherized
 
 
 ROOT = Path(__file__).resolve().parent
-RESOURCES = ROOT / "pyronot" / "resources"
+RESOURCES = ROOT / "pyroffi" / "resources"
 PRRTC_ROOT = ROOT / "cuda-rrtc" / "jax"
 SOLVE_BATCH_CHUNK_SIZE = 25
 STEP_SIZE_BY_ROBOT = {
@@ -89,7 +89,7 @@ PRRTC_UTILS = _load_module("cuda_rrtc_utils", PRRTC_ROOT / "utils.py")
 
 
 def load_robot_dataset(robot: str) -> dict[str, Any]:
-    """Load MBM dataset from pyronot/resources."""
+    """Load MBM dataset from pyroffi/resources."""
     robot_dir = RESOURCES / robot
     pkl_path = robot_dir / "problems.pkl"
 

@@ -1,6 +1,6 @@
 # cuda-rrtc: GPU-Accelerated Parallel RRTC Motion Planner
 
-`cuda-rrtc` is a CUDA-accelerated implementation of the Parallel Rapidly-exploring Random Tree (pRRTC) motion planning algorithm, designed for integration with PyRoNot's robotics kinematics and collision checking framework.
+`cuda-rrtc` is a CUDA-accelerated implementation of the Parallel Rapidly-exploring Random Tree (pRRTC) motion planning algorithm, designed for integration with PyRoFFI's robotics kinematics and collision checking framework.
 
 ## Key Features
 
@@ -18,8 +18,8 @@
 
 Install PyRoFFI
 ```
-git clone https://github.com/commalab/pyronot
-cd pyronot
+git clone https://github.com/commalab/pyroffi
+cd pyroffi
 pip install -e .
 pip install -r requirements.txt
 ```
@@ -72,7 +72,7 @@ else:
     print("Planning failed")
 ```
 
-### Collision-Aware Planning (PyRoNot Tensors)
+### Collision-Aware Planning (PyRoFFI Tensors)
 
 `prrtc_plan` is collision-aware by default and expects a `collision_context`
 dictionary. CUDA-side FK + collision checks are applied during both extend

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for pRRTC with a VAMP problem from pyronot.
+Test script for pRRTC with a VAMP problem from pyroffi.
 """
 
 import sys
@@ -11,15 +11,15 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-# Import pyronot
+# Import pyroffi
 try:
-    import pyronot as pk
+    import pyroffi as pk
     import yourdfpy
-    from pyronot.collision._obstacles import create_collision_environment
-    from pyronot.collision._robot_collision import RobotCollisionSpherized
+    from pyroffi.collision._obstacles import create_collision_environment
+    from pyroffi.collision._robot_collision import RobotCollisionSpherized
 except ImportError as e:
     print(f"Import error: {e}")
-    print("Please install pyronot and yourdfpy")
+    print("Please install pyroffi and yourdfpy")
     sys.exit(1)
 
 # Import cuda-rrtc
@@ -49,7 +49,7 @@ except Exception as e:
     sys.exit(1)
 
 
-RESOURCE_ROOT = Path("/home/scoumar/Work/rrax/pyronot/resources")
+RESOURCE_ROOT = Path("/home/scoumar/Work/rrax/pyroffi/resources")
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
 
 
@@ -70,7 +70,7 @@ def _slice_collision_context(base_ctx: dict, *, world_spheres_keep: int, self_pa
 
 
 def validate_path_collision(robot, robot_coll, path, world_obstacles):
-    """Validate solved path against full pyronot collision model."""
+    """Validate solved path against full pyroffi collision model."""
     path_np = np.asarray(path, dtype=np.float32)
     min_self = np.inf
     min_world = np.inf
@@ -259,13 +259,13 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("Testing pRRTC with PyRoNot VAMP problem")
+    print("Testing pRRTC with PyRoFFI VAMP problem")
     print("=" * 70)
     print(f"JIT tracing for pRRTC dispatch: {args.jit_trace}")
 
     if not PANDA_URDF.exists():
         print(f"ERROR: URDF not found at {PANDA_URDF}")
-        print("Please run pyronot resource generation first")
+        print("Please run pyroffi resource generation first")
         sys.exit(1)
 
     print(f"\nLoading robot from {PANDA_URDF}")

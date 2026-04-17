@@ -214,7 +214,7 @@ def prrtc_plan(
         dd_min_radius: Minimum allowed dynamic-domain radius.
         min_vals: Minimum configuration values (optional, defaults to -pi).
         max_vals: Maximum configuration values (optional, defaults to pi).
-        collision_context: Pyronot collision tensors. Collision-aware planning
+        collision_context: PyRoFFI collision tensors. Collision-aware planning
             is enabled by default and requires this context. World geometry keys
             are all optional (default empty): ``world_spheres`` [Ms,4],
             ``world_capsules`` [Mc,7], ``world_boxes`` [Mb,15],
